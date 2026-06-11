@@ -64,7 +64,7 @@ export default function Dashboard() {
             ) : (
               <>
                 <div className="text-3xl md:text-4xl font-bold font-mono text-primary">
-                  {stats?.successRate.toFixed(1)}%
+                  {(stats?.successRate ?? 0).toFixed(1)}%
                 </div>
                 <p className="text-xs text-muted-foreground mt-1 hidden sm:block">
                   {stats?.successRequests} successful / {stats?.totalRequests} total
