@@ -10,7 +10,7 @@
 
 import { Router } from "express";
 import { randomUUID } from "crypto";
-import { createHash } from "crypto";
+import { createHash, createHmac } from "crypto";
 import { execSync, spawn } from "child_process";
 import { join } from "path";
 import { db } from "@workspace/db";
@@ -24,6 +24,26 @@ const router = Router();
 // ─── Python sidecar path ──────────────────────────────────────────────────────
 
 const QWEN_CFFI_PY = join(__dirname, "qwen_cffi.py");
+
+const QWEN_ORIGIN = "https://chat.qwen.ai";
+const QWEN_BASE   = `${QWEN_ORIGIN}/api/v2`;
+
+function qwenHeaders(midtoken: string): Record<string, string> {
+  const sessionToken = getQwenSessionToken();
+  return {
+    "Content-Type":     "application/json",
+    "User-Agent":       "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/138.0.0.0 Safari/537.36",
+    "Accept":           "*/*",
+    "Accept-Language":  "en-US,en;q=0.9",
+    "Origin":           QWEN_ORIGIN,
+    "Referer":          `${QWEN_ORIGIN}/`,
+    "X-Requested-With": "XMLHttpRequest",
+    "X-Source":         "web",
+    "bx-v":             "2.5.31",
+    ...(midtoken ? { "bx-umidtoken": midtoken } : {}),
+    ...(sessionToken ? { "Authorization": `Bearer ${sessionToken}` } : {}),
+  };
+}
 
 // ─── Qwen Python helpers ──────────────────────────────────────────────────────
 
@@ -178,13 +198,22 @@ const SYSTEM_FINGERPRINT = "fp_qwen_gateway_v2";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
+type QwenContentPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string } };
+
 interface OpenAIMessage {
   role: "system" | "user" | "assistant" | "tool";
-  content: string | Array<{ type: string; text?: string; image_url?: object }> | null;
+  content: string | Array<{ type: string; text?: string; image_url?: { url: string } }> | null;
   name?: string;
   tool_calls?: ToolCall[];
   tool_call_id?: string;
   refusal?: string | null;
+}
+
+interface NormalisedMessage {
+  role: string;
+  content: string | QwenContentPart[];
 }
 
 interface ToolCall {
@@ -321,19 +350,251 @@ function sseUsageChunk(id: string, model: string, created: number, promptTokens:
 
 // ─── Message normalisation ────────────────────────────────────────────────────
 
-function normaliseMessages(messages: OpenAIMessage[]): Array<{ role: string; content: string }> {
-  return messages.map((m) => {
-    let content = "";
-    if (typeof m.content === "string") {
-      content = m.content;
-    } else if (Array.isArray(m.content)) {
-      content = m.content.filter((p) => p.type === "text").map((p) => (p as { text?: string }).text ?? "").join("\n");
+/** Returns true if any message in the array contains an image part */
+function hasImageContent(messages: OpenAIMessage[]): boolean {
+  return messages.some(
+    (m) => Array.isArray(m.content) && m.content.some((p) => p.type === "image_url"),
+  );
+}
+
+/** Extract image URLs from a message content (string or multipart). */
+function getMessageImages(content: string | QwenContentPart[] | null | undefined): string[] {
+  if (!content || typeof content === "string") return [];
+  return (content as QwenContentPart[])
+    .filter((p): p is { type: "image_url"; image_url: { url: string } } => p.type === "image_url")
+    .map(p => p.image_url?.url)
+    .filter((u): u is string => Boolean(u));
+}
+
+/** Extract plain text from a message (for history / system messages) */
+function contentToText(m: OpenAIMessage): string {
+  if (typeof m.content === "string") return m.content;
+  if (Array.isArray(m.content)) {
+    return m.content
+      .filter((p) => p.type === "text")
+      .map((p) => p.text ?? "")
+      .join("\n");
+  }
+  if (m.tool_calls && m.tool_calls.length > 0) return JSON.stringify(m.tool_calls);
+  return "";
+}
+
+function normaliseMessages(messages: OpenAIMessage[]): NormalisedMessage[] {
+  return messages.map((m): NormalisedMessage => {
+    const role = m.role === "tool" ? "user" : m.role;
+
+    // Non-user messages are always plain text
+    if (role !== "user") {
+      return { role, content: contentToText(m) };
     }
-    if (m.tool_calls && m.tool_calls.length > 0 && !content) {
-      content = JSON.stringify(m.tool_calls);
+
+    // User message: check if it has images
+    if (Array.isArray(m.content) && m.content.some((p) => p.type === "image_url")) {
+      const parts: QwenContentPart[] = [];
+      for (const p of m.content) {
+        if (p.type === "image_url" && p.image_url?.url) {
+          parts.push({ type: "image_url", image_url: { url: p.image_url.url } });
+        } else if (p.type === "text" && p.text) {
+          parts.push({ type: "text", text: p.text });
+        }
+      }
+      // Ensure at least one text part exists (Qwen requires a text part)
+      if (!parts.some((p) => p.type === "text")) {
+        parts.push({ type: "text", text: "What is in this image?" });
+      }
+      return { role, content: parts };
     }
-    return { role: m.role === "tool" ? "user" : m.role, content };
+
+    return { role, content: contentToText(m) };
   });
+}
+
+// ─── Vision / image upload helpers ───────────────────────────────────────────
+
+interface QwenFileDescriptor {
+  url: string; type: string; file_type: string; file_class: string;
+  showType: string; status: string; name: string; id: string;
+}
+
+/** Get cookies from chat.qwen.ai homepage (needed for getstsToken – no login required). */
+async function getQwenCookies(midtoken: string): Promise<string> {
+  const res = await fetch(QWEN_ORIGIN, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/138.0.0.0 Safari/537.36",
+      "bx-umidtoken": midtoken,
+    },
+    redirect: "follow",
+  });
+  const setCookie = res.headers.get("set-cookie") || "";
+  return setCookie.split(/,(?=[^ ])/).map((c: string) => c.split(";")[0].trim()).join("; ");
+}
+
+/** Detect MIME type from URL or data URI. */
+function detectMimeType(url: string): string {
+  if (url.startsWith("data:")) { const m = url.match(/^data:([^;,]+)/); return m?.[1] || "image/jpeg"; }
+  const lower = url.toLowerCase();
+  if (lower.includes(".png")) return "image/png";
+  if (lower.includes(".gif")) return "image/gif";
+  if (lower.includes(".webp")) return "image/webp";
+  return "image/jpeg";
+}
+
+/** Fetch image bytes via curl (handles hotlink protection, TLS issues, etc). */
+function fetchImageBytesViaCurl(url: string): { buf: Buffer; mimeType: string; filename: string } {
+  const result = execSync(
+    `curl -sL --max-time 20 --max-filesize 20971520 \
+      -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36" \
+      -H "Accept: image/avif,image/webp,image/apng,image/*,*/*;q=0.8" \
+      -H "Accept-Language: en-US,en;q=0.9" \
+      -H "Referer: https://www.google.com/" \
+      --tlsv1.2 \
+      -w "\\n__CONTENT_TYPE__:%{content_type}__STATUS__:%{http_code}" \
+      "${url.replace(/"/g, '\\"')}"`,
+    { maxBuffer: 25 * 1024 * 1024, encoding: "buffer" },
+  ) as unknown as Buffer;
+  const raw = result.toString("latin1");
+  const metaMatch = raw.match(/\n__CONTENT_TYPE__:([^_]*)__STATUS__:(\d+)$/);
+  if (!metaMatch) throw new Error("curl: failed to parse metadata");
+  const status = Number(metaMatch[2]);
+  if (status < 200 || status >= 300) throw new Error(`curl: HTTP ${status} for ${url}`);
+  const metaSuffix = `\n__CONTENT_TYPE__:${metaMatch[1]}__STATUS__:${metaMatch[2]}`;
+  const bodyEnd = result.length - Buffer.byteLength(metaSuffix, "latin1");
+  const buf = result.slice(0, bodyEnd);
+  const ctRaw = metaMatch[1].split(";")[0].trim();
+  const mimeType = ctRaw.startsWith("image/") ? ctRaw : detectMimeType(url);
+  const ext = mimeType.split("/")[1]?.replace("jpeg", "jpg") || "jpg";
+  const rawName = url.split("/").pop()?.split("?")[0] || `image.${ext}`;
+  const filename = rawName.includes(".") ? rawName : `${rawName}.${ext}`;
+  return { buf, mimeType, filename };
+}
+
+/** Fetch image bytes – tries Node fetch first, falls back to curl. */
+async function fetchImageBytes(url: string): Promise<{ buf: Buffer; mimeType: string; filename: string }> {
+  if (url.startsWith("data:")) {
+    const m = url.match(/^data:([^;,]+);base64,(.+)$/);
+    if (!m) throw new Error("Invalid data URI");
+    const mimeType = m[1];
+    const buf = Buffer.from(m[2], "base64");
+    const ext = mimeType.split("/")[1]?.replace("jpeg", "jpg") || "jpg";
+    return { buf, mimeType, filename: `image.${ext}` };
+  }
+  try {
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "Referer": "https://www.google.com/",
+      },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (res.ok) {
+      const buf = Buffer.from(await res.arrayBuffer());
+      const ct = res.headers.get("content-type")?.split(";")[0].trim() || detectMimeType(url);
+      const mimeType = ct.startsWith("image/") ? ct : detectMimeType(url);
+      const ext = mimeType.split("/")[1]?.replace("jpeg", "jpg") || "jpg";
+      const rawName = url.split("/").pop()?.split("?")[0] || `image.${ext}`;
+      const filename = rawName.includes(".") ? rawName : `${rawName}.${ext}`;
+      return { buf, mimeType, filename };
+    }
+    logger.debug({ status: res.status, url: url.slice(0, 80) }, "vision: fetch failed, retrying with curl");
+  } catch (err) {
+    logger.debug({ err: String(err), url: url.slice(0, 80) }, "vision: fetch error, retrying with curl");
+  }
+  return fetchImageBytesViaCurl(url);
+}
+
+/**
+ * Upload one image to Qwen OSS and return a QwenFileDescriptor.
+ * Flow: getstsToken → OSS PUT (HMAC-SHA1) → /files/parse → descriptor
+ * Works WITHOUT a session token – only needs bx-umidtoken + acw_tc cookie.
+ */
+async function uploadImageToQwen(
+  imageUrl: string,
+  uploadHeaders: Record<string, string>,
+): Promise<QwenFileDescriptor> {
+  const { buf, mimeType, filename } = await fetchImageBytes(imageUrl);
+
+  const stsRes = await fetch(`${QWEN_BASE}/files/getstsToken`, {
+    method: "POST",
+    headers: uploadHeaders,
+    body: JSON.stringify({ filename, filesize: String(buf.length), filetype: "image" }),
+  });
+  const stsData = (await stsRes.json()) as {
+    data: { file_id: string; file_url: string; file_path: string; bucketname: string; endpoint: string; access_key_id: string; access_key_secret: string; security_token: string };
+  };
+  const sts = stsData.data;
+
+  const date = new Date().toUTCString();
+  const stringToSign = `PUT\n\n${mimeType}\n${date}\nx-oss-security-token:${sts.security_token}\n/${sts.bucketname}/${sts.file_path}`;
+  const sig = createHmac("sha1", sts.access_key_secret).update(stringToSign).digest("base64");
+
+  const putRes = await fetch(`https://${sts.bucketname}.${sts.endpoint}/${sts.file_path}`, {
+    method: "PUT",
+    headers: {
+      "Content-Type": mimeType, "Date": date,
+      "Authorization": `OSS ${sts.access_key_id}:${sig}`,
+      "x-oss-security-token": sts.security_token,
+    },
+    body: buf,
+  });
+  if (!putRes.ok) {
+    const errText = await putRes.text().catch(() => "");
+    throw new Error(`OSS PUT failed: ${putRes.status} ${errText.slice(0, 200)}`);
+  }
+
+  await fetch(`${QWEN_BASE}/files/parse`, {
+    method: "POST",
+    headers: uploadHeaders,
+    body: JSON.stringify({ file_id: sts.file_id }),
+  });
+
+  return {
+    url: sts.file_url, type: "image", file_type: mimeType,
+    file_class: "vision", showType: "image", status: "uploaded",
+    name: filename, id: sts.file_id,
+  };
+}
+
+/** Upload all images in parallel, skip failures. */
+async function resolveImageUrls(
+  imageUrls: string[],
+  uploadHeaders: Record<string, string>,
+): Promise<QwenFileDescriptor[]> {
+  const results = await Promise.all(
+    imageUrls.map(u =>
+      uploadImageToQwen(u, uploadHeaders).catch(err => {
+        logger.warn({ err: String(err), url: u.slice(0, 80) }, "vision: image upload failed, skipping");
+        return null;
+      }),
+    ),
+  );
+  return results.filter((r): r is QwenFileDescriptor => r !== null);
+}
+
+/** Build plain-text prompt from messages (strips image parts when files[] handles them). */
+function messagesToTextPrompt(messages: NormalisedMessage[], imagesHandledByFiles = false): string {
+  return messages.map(m => {
+    let txt: string;
+    if (typeof m.content === "string") {
+      txt = m.content;
+    } else if (Array.isArray(m.content)) {
+      if (imagesHandledByFiles) {
+        // Strip image parts – they're in files[]
+        txt = (m.content as QwenContentPart[])
+          .filter((p): p is { type: "text"; text: string } => p.type === "text")
+          .map(p => p.text).join("\n");
+      } else {
+        txt = (m.content as QwenContentPart[])
+          .filter((p): p is { type: "text"; text: string } => p.type === "text")
+          .map(p => p.text).join("\n");
+      }
+    } else {
+      txt = "";
+    }
+    if (m.role === "system")    return `System: ${txt}`;
+    if (m.role === "assistant") return `Assistant: ${txt}`;
+    return `User: ${txt}`;
+  }).join("\n");
 }
 
 // ─── Stop sequence / tool detection ──────────────────────────────────────────
@@ -437,9 +698,9 @@ function extractJson(text: string): string {
  * json_object or json_schema. OpenAI spec: model MUST output valid JSON.
  */
 function injectJsonMode(
-  messages: Array<{ role: string; content: string }>,
+  messages: NormalisedMessage[],
   responseFormat: ChatCompletionRequest["response_format"],
-): Array<{ role: string; content: string }> {
+): NormalisedMessage[] {
   if (!responseFormat || responseFormat.type === "text") return messages;
 
   let systemInstruction: string;
@@ -453,7 +714,6 @@ function injectJsonMode(
       `No prose, no markdown, no code fences — raw JSON only. ` +
       `The JSON must conform to the following schema named "${schemaName}":\n${schemaDef}`;
   } else {
-    // json_object
     systemInstruction =
       `You MUST respond with a valid JSON object only. ` +
       `No prose, no markdown, no code fences — raw JSON only. ` +
@@ -461,7 +721,7 @@ function injectJsonMode(
   }
 
   const first = messages[0];
-  if (first?.role === "system") {
+  if (first?.role === "system" && typeof first.content === "string") {
     return [{ role: "system", content: `${first.content}\n\n${systemInstruction}` }, ...messages.slice(1)];
   }
   return [{ role: "system", content: systemInstruction }, ...messages];
@@ -485,7 +745,7 @@ function resolveThinking(effort: ChatCompletionRequest["reasoning_effort"]): {
   }
 }
 
-function injectToolPrompt(messages: Array<{ role: string; content: string }>, tools: ChatCompletionRequest["tools"]): Array<{ role: string; content: string }> {
+function injectToolPrompt(messages: NormalisedMessage[], tools: ChatCompletionRequest["tools"]): NormalisedMessage[] {
   if (!tools || tools.length === 0) return messages;
   const defs = tools.map(t => {
     const f = t.function;
@@ -499,7 +759,7 @@ Do NOT output anything else when calling tools. When not calling a tool, respond
 AVAILABLE TOOLS:\n${defs}`;
 
   const first = messages[0];
-  if (first?.role === "system") {
+  if (first?.role === "system" && typeof first.content === "string") {
     return [{ role: "system", content: `${first.content}\n\n${systemBlock}` }, ...messages.slice(1)];
   }
   return [{ role: "system", content: systemBlock }, ...messages];
@@ -619,11 +879,22 @@ router.post("/chat/completions", async (req, res) => {
     }
 
     // 7. Build Qwen payload
-    const userPrompt = augmentedMessages.map(m => {
-      if (m.role === "system") return `System: ${m.content}`;
-      if (m.role === "assistant") return `Assistant: ${m.content}`;
-      return `User: ${m.content}`;
-    }).join("\n");
+    // Detect image content across all messages
+    const allImageUrls = augmentedMessages.flatMap(m => getMessageImages(m.content));
+    const isVision = allImageUrls.length > 0;
+
+    // Upload images to Qwen OSS (no login required – only bx-umidtoken + acw_tc cookie)
+    let resolvedFiles: QwenFileDescriptor[] = [];
+    if (isVision) {
+      const effectiveMidtoken = midtoken || (await getPooledMidtoken());
+      const cookie = await getQwenCookies(effectiveMidtoken);
+      const uploadHeaders = { ...qwenHeaders(midtoken), Cookie: cookie };
+      resolvedFiles = await resolveImageUrls(allImageUrls, uploadHeaders);
+      logger.info({ count: resolvedFiles.length, total: allImageUrls.length }, "vision: images uploaded to Qwen OSS");
+    }
+
+    // Build text prompt (strip image parts when files[] handles them natively)
+    const qwenMessageContent = messagesToTextPrompt(augmentedMessages, resolvedFiles.length > 0);
 
     const qwenPayload = {
       stream: true,
@@ -640,9 +911,9 @@ router.post("/chat/completions", async (req, res) => {
         parentId: null,
         childrenIds: [],
         role: "user",
-        content: userPrompt,
+        content: qwenMessageContent,
         user_action: "chat",
-        files: [],
+        files: resolvedFiles,
         models: [model],
         chat_type: "t2t",
         feature_config: { thinking_enabled: thinking.thinking_enabled, output_schema: "phase", thinking_budget: thinking.thinking_budget },
