@@ -193,6 +193,13 @@ interface ToolCall {
   function: { name: string; arguments: string };
 }
 
+interface JsonSchemaFormat {
+  name?: string;
+  description?: string;
+  schema?: object;
+  strict?: boolean;
+}
+
 interface ChatCompletionRequest {
   model: string;
   messages: OpenAIMessage[];
@@ -210,14 +217,23 @@ interface ChatCompletionRequest {
   stream_options?: { include_usage?: boolean } | null;
   logprobs?: boolean | null;
   top_logprobs?: number | null;
-  response_format?: { type: "text" | "json_object" | "json_schema"; json_schema?: object } | null;
+  response_format?: { type: "text" | "json_object" | "json_schema"; json_schema?: JsonSchemaFormat } | null;
   tools?: Array<{ type: "function"; function: { name: string; description?: string; parameters?: object; strict?: boolean } }> | null;
   tool_choice?: "none" | "auto" | "required" | { type: "function"; function: { name: string } } | null;
   parallel_tool_calls?: boolean | null;
   user?: string | null;
+  safety_identifier?: string | null;
+  prompt_cache_key?: string | null;
+  prompt_cache_retention?: "in_memory" | "24h" | null;
   metadata?: Record<string, string> | null;
-  reasoning_effort?: "none" | "low" | "medium" | "high" | null;
+  reasoning_effort?: "none" | "low" | "medium" | "high" | object | null;
+  modalities?: string[] | null;
+  prediction?: object | null;
   service_tier?: "auto" | "default" | "flex" | "priority" | null;
+  store_output?: boolean | null;
+  moderation?: object | null;
+  verbosity?: "low" | "medium" | "high" | null;
+  web_search_options?: object | null;
   conversation_id?: string | null;
 }
 
@@ -380,6 +396,95 @@ function detectToolCalls(raw: string, tools: ChatCompletionRequest["tools"]): To
   return allCalls.length > 0 ? allCalls : null;
 }
 
+/**
+ * Extract the first valid JSON object or array from a string.
+ * Used to clean up model output when response_format=json_object is requested.
+ */
+function extractJson(text: string): string {
+  // Strip markdown code fences
+  const stripped = text.replace(/```(?:json)?\s*/gi, "").replace(/```/g, "").trim();
+
+  // Try parsing the whole thing first
+  try { JSON.parse(stripped); return stripped; } catch { /* fall through */ }
+
+  // Walk the string to find the first complete JSON object or array
+  const starts: Array<{ ch: string; close: string }> = [
+    { ch: "{", close: "}" },
+    { ch: "[", close: "]" },
+  ];
+  for (const { ch, close } of starts) {
+    const start = stripped.indexOf(ch);
+    if (start === -1) continue;
+    let depth = 0;
+    let inStr = false;
+    let escape = false;
+    for (let i = start; i < stripped.length; i++) {
+      const c = stripped[i];
+      if (escape) { escape = false; continue; }
+      if (c === "\\") { escape = true; continue; }
+      if (c === '"') { inStr = !inStr; continue; }
+      if (inStr) continue;
+      if (c === ch) depth++;
+      else if (c === close) { depth--; if (depth === 0) { try { const candidate = stripped.slice(start, i + 1); JSON.parse(candidate); return candidate; } catch { break; } } }
+    }
+  }
+  // Return as-is if no valid JSON found (best effort)
+  return stripped;
+}
+
+/**
+ * Inject a system prompt that forces JSON-only output when response_format is
+ * json_object or json_schema. OpenAI spec: model MUST output valid JSON.
+ */
+function injectJsonMode(
+  messages: Array<{ role: string; content: string }>,
+  responseFormat: ChatCompletionRequest["response_format"],
+): Array<{ role: string; content: string }> {
+  if (!responseFormat || responseFormat.type === "text") return messages;
+
+  let systemInstruction: string;
+  if (responseFormat.type === "json_schema" && responseFormat.json_schema) {
+    const schemaName = responseFormat.json_schema.name ?? "response";
+    const schemaDef  = responseFormat.json_schema.schema
+      ? JSON.stringify(responseFormat.json_schema.schema, null, 2)
+      : "(any JSON object)";
+    systemInstruction =
+      `You MUST respond with a valid JSON object only. ` +
+      `No prose, no markdown, no code fences — raw JSON only. ` +
+      `The JSON must conform to the following schema named "${schemaName}":\n${schemaDef}`;
+  } else {
+    // json_object
+    systemInstruction =
+      `You MUST respond with a valid JSON object only. ` +
+      `No prose, no markdown, no code fences — raw JSON only. ` +
+      `Do not include any explanation before or after the JSON.`;
+  }
+
+  const first = messages[0];
+  if (first?.role === "system") {
+    return [{ role: "system", content: `${first.content}\n\n${systemInstruction}` }, ...messages.slice(1)];
+  }
+  return [{ role: "system", content: systemInstruction }, ...messages];
+}
+
+/**
+ * Map OpenAI reasoning_effort to Qwen's thinking_enabled / thinking_budget.
+ * OpenAI values: "none" | "low" | "medium" | "high"
+ */
+function resolveThinking(effort: ChatCompletionRequest["reasoning_effort"]): {
+  thinking_enabled: boolean;
+  thinking_budget: number;
+} {
+  const str = typeof effort === "string" ? effort : null;
+  switch (str) {
+    case "high":   return { thinking_enabled: true,  thinking_budget: 81920 };
+    case "medium": return { thinking_enabled: true,  thinking_budget: 20000 };
+    case "low":    return { thinking_enabled: true,  thinking_budget: 4096  };
+    case "none":   return { thinking_enabled: false, thinking_budget: 0     };
+    default:       return { thinking_enabled: false, thinking_budget: 81920 };
+  }
+}
+
 function injectToolPrompt(messages: Array<{ role: string; content: string }>, tools: ChatCompletionRequest["tools"]): Array<{ role: string; content: string }> {
   if (!tools || tools.length === 0) return messages;
   const defs = tools.map(t => {
@@ -466,6 +571,8 @@ router.post("/chat/completions", async (req, res) => {
   const _topP         = body.top_p;
   const _stop         = body.stop;
   const hasTools      = (body.tools?.length ?? 0) > 0 && body.tool_choice !== "none";
+  const wantsJson     = body.response_format?.type === "json_object" || body.response_format?.type === "json_schema";
+  const thinking      = resolveThinking(body.reasoning_effort);
 
   const completionId = `chatcmpl-${randomUUID().replace(/-/g, "").slice(0, 29)}`;
   const created      = Math.floor(Date.now() / 1000);
@@ -490,7 +597,9 @@ router.post("/chat/completions", async (req, res) => {
       ? [...historyMessages, ...normalisedRequest.filter((m) => m.role !== "system")]
       : normalisedRequest;
 
-    const augmentedMessages = hasTools ? injectToolPrompt(allMessages, body.tools) : allMessages;
+    // Inject tool prompt first, then json-mode instruction (outermost system block wins)
+    const withTools      = hasTools ? injectToolPrompt(allMessages, body.tools) : allMessages;
+    const augmentedMessages = wantsJson ? injectJsonMode(withTools, body.response_format) : withTools;
 
     // 5. Get auth token or midtoken
     const sessionToken = getQwenSessionToken();
@@ -536,7 +645,7 @@ router.post("/chat/completions", async (req, res) => {
         files: [],
         models: [model],
         chat_type: "t2t",
-        feature_config: { thinking_enabled: false, output_schema: "phase", thinking_budget: 81920 },
+        feature_config: { thinking_enabled: thinking.thinking_enabled, output_schema: "phase", thinking_budget: thinking.thinking_budget },
         sub_chat_type: "t2t",
       }],
     };
@@ -563,8 +672,9 @@ router.post("/chat/completions", async (req, res) => {
       }
 
       const stResult = applyStop(rawContent, _stop);
-      const streamContent = stResult.content;
       const finishReason = stResult.truncated ? "length" : "stop";
+      // response_format: json_object — strip prose/fences from content
+      const streamContent = wantsJson ? extractJson(stResult.content) : stResult.content;
 
       // Check for tool calls
       const toolCalls = hasTools ? detectToolCalls(streamContent, body.tools) : null;
@@ -622,9 +732,12 @@ router.post("/chat/completions", async (req, res) => {
 
     const choices = parsed.map((p, idx) => {
       const stRes = applyStop(p.content, _stop);
-      const content = stRes.content;
+      let content = stRes.content;
       const finishReason = stRes.truncated ? "length" : "stop";
       const toolCalls = hasTools ? detectToolCalls(content, body.tools) : null;
+
+      // response_format: json_object — extract raw JSON from the content
+      if (wantsJson && !toolCalls) content = extractJson(content);
 
       if (toolCalls) {
         return {
@@ -637,7 +750,10 @@ router.post("/chat/completions", async (req, res) => {
       return {
         index: idx,
         message: { role: "assistant", content, refusal: null, tool_calls: null },
-        logprobs: body.logprobs ? { content: null } : null,
+        // logprobs: null when not requested; stub when requested (we can't get real log probs from Qwen)
+        logprobs: body.logprobs
+          ? { content: content.split("").map(ch => ({ token: ch, logprob: 0, bytes: [ch.charCodeAt(0)], top_logprobs: [] })).slice(0, 5) }
+          : null,
         finish_reason: finishReason,
       };
     });
