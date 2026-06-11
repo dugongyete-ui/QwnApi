@@ -20,6 +20,7 @@ except ImportError:
 
 
 QWEN_BASE = "https://chat.qwen.ai/api/v2"
+DEFAULT_IMPERSONATE = "chrome120"
 
 # Optional session cookie — set QWEN_COOKIE env var to your browser session cookie
 # to bypass the WAF challenge that blocks anonymous requests.
@@ -74,6 +75,7 @@ def create_chat(midtoken: str, model: str) -> dict:
                 url,
                 json=payload,
                 headers=headers,
+                impersonate=DEFAULT_IMPERSONATE,
                 timeout=30,
             )
             raw = resp.text
@@ -182,6 +184,7 @@ def chat_completions(
                 url,
                 json=payload,
                 headers=headers,
+                impersonate=DEFAULT_IMPERSONATE,
                 timeout=120,
             )
             raw = resp.text
@@ -333,6 +336,7 @@ def fetch_token() -> dict:
                 resp = cffi_requests.get(
                     url,
                     headers=headers_base,
+                    impersonate=DEFAULT_IMPERSONATE,
                     timeout=15,
                 )
                 if resp.status_code == 200:
