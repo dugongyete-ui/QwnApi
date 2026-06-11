@@ -1,1 +1,3 @@
 - [Qwen WAF bypass](qwen-waf-bypass.md) — curl_cffi WITHOUT impersonate= bypasses Aliyun WAF; with impersonate="chrome120" is blocked.
+- [Qwen V2 API model names](qwen-v2-models.md) — Old model names (qwen-turbo/plus/max) return Not_Found on V2 endpoint; use qwen3-235b-a22b, qwen3-30b-a3b, qwen3.7-max, qwen3.7-plus.
+- [Qwen V2 engine interface](qwen-v2-engine.md) — V2 uses qwen_cffi.py via CLI args + streaming SSE, not stdin JSON. Endpoint: /api/v2/chats/new + /api/v2/chat/completions?chat_id=.

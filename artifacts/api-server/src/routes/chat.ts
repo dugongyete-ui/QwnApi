@@ -12,10 +12,10 @@ import { SendChatBody } from "@workspace/api-zod";
 const router = Router();
 
 const MODELS = [
-  { id: "qwen-plus", name: "Qwen Plus", description: "Balanced speed and capability", maxTokens: 131072 },
-  { id: "qwen-max", name: "Qwen Max", description: "Most capable model for complex tasks", maxTokens: 32768 },
-  { id: "qwen-turbo", name: "Qwen Turbo", description: "Fastest, optimized for quick responses", maxTokens: 131072 },
-  { id: "qwen3.7-plus", name: "Qwen 3.7 Plus", description: "Latest Qwen 3.7 with enhanced reasoning", maxTokens: 131072 },
+  { id: "qwen3-235b-a22b", name: "Qwen3 235B", description: "Flagship MoE model, most capable", maxTokens: 131072 },
+  { id: "qwen3-30b-a3b", name: "Qwen3 30B", description: "Efficient MoE model, fast and capable", maxTokens: 131072 },
+  { id: "qwen3.7-max", name: "Qwen3.7 Max", description: "Most capable dense model", maxTokens: 131072 },
+  { id: "qwen3.7-plus", name: "Qwen3.7 Plus", description: "Balanced speed and capability", maxTokens: 131072 },
 ];
 
 router.post("/chat", async (req, res) => {
@@ -25,7 +25,7 @@ router.post("/chat", async (req, res) => {
     return;
   }
 
-  const { prompt, model = "qwen-plus", conversationId } = parsed.data;
+  const { prompt, model = "qwen3-235b-a22b", conversationId } = parsed.data;
   const startTime = Date.now();
 
   const midtoken = await getPooledMidtoken();
