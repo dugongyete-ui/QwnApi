@@ -8,6 +8,7 @@ Supports full OpenAI-compatible generation parameters.
 import sys
 import json
 import uuid
+import os
 
 try:
     from curl_cffi import requests as cffi_requests
@@ -21,9 +22,27 @@ except ImportError:
 QWEN_BASE = "https://chat.qwen.ai/api/v2"
 DEFAULT_IMPERSONATE = "chrome120"
 
+# Optional session cookie — set QWEN_COOKIE env var to your browser session cookie
+# to bypass the WAF challenge that blocks anonymous requests.
+QWEN_COOKIE = os.environ.get("QWEN_COOKIE", "").strip()
+
+
+def _is_waf_response(text: str, status: int) -> bool:
+    """Detect Alibaba WAF challenge page (returns 200 but is HTML)."""
+    if not text:
+        return False
+    low = text.lstrip().lower()
+    return (
+        low.startswith("<!doctype") or
+        low.startswith("<html") or
+        "aliyun_waf" in low or
+        "_waf_is_mob" in low or
+        "distil_r_captcha" in low
+    )
+
 
 def get_headers(midtoken: str) -> dict:
-    return {
+    headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
         "Origin": "https://chat.qwen.ai",
@@ -33,6 +52,9 @@ def get_headers(midtoken: str) -> dict:
         "bx-v": "2.5.31",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     }
+    if QWEN_COOKIE:
+        headers["Cookie"] = QWEN_COOKIE
+    return headers
 
 
 def create_chat(midtoken: str, model: str) -> dict:
@@ -56,7 +78,8 @@ def create_chat(midtoken: str, model: str) -> dict:
                 impersonate=DEFAULT_IMPERSONATE,
                 timeout=30,
             )
-            data = resp.json()
+            raw = resp.text
+            status = resp.status_code
         else:
             req = urllib.request.Request(
                 url,
@@ -65,8 +88,15 @@ def create_chat(midtoken: str, model: str) -> dict:
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=30) as r:
-                data = json.loads(r.read().decode())
+                raw = r.read().decode()
+                status = r.status
 
+        if _is_waf_response(raw, status):
+            # WAF blocked — generate a local UUID so the caller can still proceed
+            # (the real failure will surface in chat_completions)
+            return {"success": False, "error": "WAF_BLOCKED", "code": "WAF_BLOCKED", "chatId": str(uuid.uuid4())}
+
+        data = json.loads(raw)
         chat_id = data.get("data", {}).get("chat", {}).get("id") or data.get("id")
         if not chat_id:
             chat_id = str(uuid.uuid4())
@@ -179,6 +209,17 @@ def chat_completions(
                 "success": False,
                 "error": "Token validation failed",
                 "code": "TOKEN_INVALID",
+                "status": status,
+            }
+
+        if _is_waf_response(raw, status):
+            return {
+                "success": False,
+                "error": (
+                    "WAF challenge blocked the request. "
+                    "Set the QWEN_COOKIE environment variable with your chat.qwen.ai session cookie to authenticate."
+                ),
+                "code": "WAF_BLOCKED",
                 "status": status,
             }
 
