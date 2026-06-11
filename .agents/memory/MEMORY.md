@@ -1,0 +1,1 @@
+- [Qwen WAF bypass](qwen-waf-bypass.md) — curl_cffi WITHOUT impersonate= bypasses Aliyun WAF; with impersonate="chrome120" is blocked.

@@ -4,29 +4,177 @@
  * Supports: all generation params, streaming SSE, API key auth, n completions,
  * tools/function calling schema, response_format, logprobs (passthrough),
  * reasoning_effort, stream_options (include_usage), and every other documented parameter.
+ *
+ * WAF bypass: routes all Qwen calls through qwen_cffi.py (curl_cffi without impersonation)
  */
 
 import { Router } from "express";
 import { randomUUID } from "crypto";
 import { createHash } from "crypto";
+import { execSync, spawn } from "child_process";
+import { join } from "path";
 import { db } from "@workspace/db";
 import { chatSessionsTable, apiKeysTable, gatewayStatsTable, requestLogsTable } from "@workspace/db";
 import { eq, sql } from "drizzle-orm";
 import { getPooledMidtoken } from "../lib/umid-pool";
-import { createChat, chatCompletions, type QwenGenerationParams } from "../lib/qwenEngine";
+import { logger } from "../lib/logger";
 
 const router = Router();
 
-// ─── Constants ───────────────────────────────────────────────────────────────
+// ─── Python sidecar path ──────────────────────────────────────────────────────
 
-const SYSTEM_FINGERPRINT = "fp_qwen_gateway_v1";
+const QWEN_CFFI_PY = join(__dirname, "qwen_cffi.py");
 
-const MODELS = [
-  { id: "qwen-plus",    name: "Qwen Plus",    description: "Balanced speed and capability",        maxTokens: 131072 },
-  { id: "qwen-max",     name: "Qwen Max",     description: "Most capable model for complex tasks", maxTokens: 32768  },
-  { id: "qwen-turbo",   name: "Qwen Turbo",   description: "Fastest, optimised for quick replies", maxTokens: 131072 },
-  { id: "qwen3.7-plus", name: "Qwen 3.7 Plus",description: "Qwen 3.7 with enhanced reasoning",    maxTokens: 131072 },
+// ─── Qwen Python helpers ──────────────────────────────────────────────────────
+
+function getQwenSessionToken(): string | undefined {
+  return process.env["QWEN_SESSION_TOKEN"] || undefined;
+}
+
+function checkQwenWaf(text: string): void {
+  const low = text.trimStart().toLowerCase();
+  if (low.startsWith("<!doctype") || low.startsWith("<html") || low.includes("aliyun_waf")) {
+    throw new Error(
+      "Qwen API diblokir WAF Aliyun dari IP ini. " +
+      "Set env var QWEN_SESSION_TOKEN dengan Bearer token dari akun Qwen Anda " +
+      "(buka chat.qwen.ai → DevTools → Network → salin header Authorization)."
+    );
+  }
+}
+
+/**
+ * Create a new Qwen chat session via Python subprocess.
+ * Returns the chat ID.
+ */
+function qwenPyCreate(token: string, model: string, midtoken?: string): string {
+  const mid = midtoken ?? "";
+  const out = execSync(
+    `python3 "${QWEN_CFFI_PY}" create "${token}" "${model}" "${mid}"`,
+    { timeout: 15000, encoding: "utf8" },
+  );
+  checkQwenWaf(out);
+  const data = JSON.parse(out) as { success?: boolean; data?: { id?: string } };
+  const chatId = data?.data?.id;
+  if (!chatId) throw new Error(`qwen: createChat failed: ${out.slice(0, 200)}`);
+  return chatId;
+}
+
+/**
+ * Send a chat request via Python subprocess and collect the full SSE body.
+ */
+function qwenPyBody(token: string, chatId: string, payload: unknown, midtoken?: string): Promise<string> {
+  const payloadB64 = Buffer.from(JSON.stringify(payload)).toString("base64");
+  const args = [QWEN_CFFI_PY, "chat", token, chatId, payloadB64];
+  if (midtoken) args.push(midtoken);
+
+  return new Promise<string>((resolve, reject) => {
+    const py = spawn("python3", args);
+    const chunks: Buffer[] = [];
+    py.stdout.on("data", (d: Buffer) => chunks.push(d));
+    py.stderr.on("data", (d: Buffer) => logger.warn({ err: d.toString().trim() }, "qwen-cffi: stderr"));
+    const timer = setTimeout(() => { py.kill(); reject(new Error("qwen-cffi: timeout")); }, 90000);
+    py.on("close", (code) => {
+      clearTimeout(timer);
+      // exit 2 = risk-control triggered; Python already wrote error SSE to stdout — resolve it.
+      if (code !== 0 && code !== 2) reject(new Error(`qwen-cffi: exit ${code}`));
+      else resolve(Buffer.concat(chunks).toString("utf8"));
+    });
+    py.on("error", reject);
+  });
+}
+
+/**
+ * Parse Qwen SSE body into content + token counts.
+ */
+function parseQwenSSE(body: string): {
+  content: string;
+  inputTokens: number;
+  outputTokens: number;
+  upstreamError?: { message: string; code?: string };
+} {
+  let answer = "";
+  let fallback = "";
+  let inputTokens = 0;
+  let outputTokens = 0;
+
+  for (const line of body.split("\n")) {
+    if (!line.startsWith("data:")) continue;
+    try {
+      const chunk = JSON.parse(line.slice(5).trim()) as {
+        error?: { message?: string; code?: string };
+        choices?: Array<{ delta?: { content?: string; extra?: { output_schema?: string } } }>;
+        usage?: { input_tokens?: number; output_tokens?: number };
+      };
+      if (chunk.error) {
+        return {
+          content: "",
+          inputTokens: 0,
+          outputTokens: 0,
+          upstreamError: {
+            message: chunk.error.message ?? "Upstream error",
+            code: chunk.error.code,
+          },
+        };
+      }
+      if (chunk.usage) {
+        inputTokens = chunk.usage.input_tokens ?? inputTokens;
+        outputTokens = chunk.usage.output_tokens ?? outputTokens;
+      }
+      const delta = chunk.choices?.[0]?.delta;
+      const content = delta?.content ?? "";
+      if (!content) continue;
+      const schema = delta?.extra?.output_schema ?? "";
+      if (schema === "answer") {
+        answer += content;
+      } else {
+        fallback += content;
+      }
+    } catch { /* skip malformed */ }
+  }
+
+  return { content: answer || fallback, inputTokens, outputTokens };
+}
+
+// ─── Model registry ───────────────────────────────────────────────────────────
+
+const QWEN_API_MODEL_MAP: Record<string, string> = {
+  "qwen3-235b-a22b":  "qwen-plus-2025-07-28",
+  "qwen3-30b-a3b":    "qwen3.5-35b-a3b",
+  "qwen-plus":        "qwen-plus-2025-07-28",
+  "qwen-max":         "qwen3.7-max",
+  "qwen-turbo":       "qwen3.5-flash",
+};
+
+function resolveModel(raw: string): string {
+  return QWEN_API_MODEL_MAP[raw] ?? raw;
+}
+
+interface ModelEntry {
+  id: string;
+  object: string;
+  created: number;
+  owned_by: string;
+  context_window?: number;
+}
+
+const MODELS_CREATED = Math.floor(Date.now() / 1000);
+
+const MODELS: ModelEntry[] = [
+  { id: "qwen3-235b-a22b",  object: "model", created: MODELS_CREATED, owned_by: "qwen-gateway", context_window: 131072 },
+  { id: "qwen3-30b-a3b",    object: "model", created: MODELS_CREATED, owned_by: "qwen-gateway", context_window: 131072 },
+  { id: "qwen3.7-max",      object: "model", created: MODELS_CREATED, owned_by: "qwen-gateway", context_window: 131072 },
+  { id: "qwen3.7-plus",     object: "model", created: MODELS_CREATED, owned_by: "qwen-gateway", context_window: 131072 },
+  { id: "qwen3.6-plus",     object: "model", created: MODELS_CREATED, owned_by: "qwen-gateway", context_window: 131072 },
+  { id: "qwen3.5-flash",    object: "model", created: MODELS_CREATED, owned_by: "qwen-gateway", context_window: 131072 },
+  { id: "qwen3.5-35b-a3b",  object: "model", created: MODELS_CREATED, owned_by: "qwen-gateway", context_window: 131072 },
+  { id: "qwen-plus",        object: "model", created: MODELS_CREATED, owned_by: "qwen-gateway", context_window: 131072 },
+  { id: "qwen-max",         object: "model", created: MODELS_CREATED, owned_by: "qwen-gateway", context_window: 32768  },
+  { id: "qwen-turbo",       object: "model", created: MODELS_CREATED, owned_by: "qwen-gateway", context_window: 131072 },
 ];
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+const SYSTEM_FINGERPRINT = "fp_qwen_gateway_v2";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -48,7 +196,6 @@ interface ToolCall {
 interface ChatCompletionRequest {
   model: string;
   messages: OpenAIMessage[];
-  // Generation params
   temperature?: number | null;
   top_p?: number | null;
   n?: number | null;
@@ -59,32 +206,18 @@ interface ChatCompletionRequest {
   frequency_penalty?: number | null;
   logit_bias?: Record<string, number> | null;
   seed?: number | null;
-  // Output / streaming
   stream?: boolean | null;
   stream_options?: { include_usage?: boolean } | null;
   logprobs?: boolean | null;
   top_logprobs?: number | null;
   response_format?: { type: "text" | "json_object" | "json_schema"; json_schema?: object } | null;
-  // Tools
   tools?: Array<{ type: "function"; function: { name: string; description?: string; parameters?: object; strict?: boolean } }> | null;
   tool_choice?: "none" | "auto" | "required" | { type: "function"; function: { name: string } } | null;
   parallel_tool_calls?: boolean | null;
-  // Identity / caching
   user?: string | null;
-  safety_identifier?: string | null;
-  prompt_cache_key?: string | null;
-  prompt_cache_retention?: string | null;
   metadata?: Record<string, string> | null;
-  // Advanced
   reasoning_effort?: "none" | "low" | "medium" | "high" | null;
-  modalities?: string[] | null;
-  prediction?: object | null;
   service_tier?: "auto" | "default" | "flex" | "priority" | null;
-  store_output?: boolean | null;
-  moderation?: object | null;
-  verbosity?: "low" | "medium" | "high" | null;
-  web_search_options?: object | null;
-  // Gateway-extension (not part of OpenAI spec — passthrough)
   conversation_id?: string | null;
 }
 
@@ -97,18 +230,12 @@ async function resolveApiKey(authHeader: string | undefined): Promise<
     return { ok: false, statusCode: 401, error: "Missing or malformed Authorization header. Expected: Bearer <key>" };
   }
   const key = authHeader.slice(7).trim();
-  if (!key) {
-    return { ok: false, statusCode: 401, error: "Empty API key" };
-  }
+  if (!key) return { ok: false, statusCode: 401, error: "Empty API key" };
   const hash = createHash("sha256").update(key).digest("hex");
   const rows = await db.select().from(apiKeysTable).where(eq(apiKeysTable.keyHash, hash));
   const row = rows[0];
-  if (!row) {
-    return { ok: false, statusCode: 401, error: "Invalid API key" };
-  }
-  if (!row.isActive) {
-    return { ok: false, statusCode: 403, error: "API key is inactive" };
-  }
+  if (!row) return { ok: false, statusCode: 401, error: "Invalid API key" };
+  if (!row.isActive) return { ok: false, statusCode: 403, error: "API key is inactive" };
   return { ok: true, keyId: row.id };
 }
 
@@ -133,9 +260,9 @@ async function recordRequest(success: boolean, responseTime: number, model: stri
     }).onConflictDoUpdate({
       target: gatewayStatsTable.id,
       set: {
-        totalRequests:    sql`gateway_stats.total_requests + 1`,
-        successRequests:  sql`gateway_stats.success_requests + ${success ? 1 : 0}`,
-        failedRequests:   sql`gateway_stats.failed_requests + ${success ? 0 : 1}`,
+        totalRequests:     sql`gateway_stats.total_requests + 1`,
+        successRequests:   sql`gateway_stats.success_requests + ${success ? 1 : 0}`,
+        failedRequests:    sql`gateway_stats.failed_requests + ${success ? 0 : 1}`,
         totalResponseTime: sql`gateway_stats.total_response_time + ${responseTime}`,
         updatedAt: new Date(),
       },
@@ -143,7 +270,7 @@ async function recordRequest(success: boolean, responseTime: number, model: stri
   } catch { /* non-fatal */ }
 }
 
-// ─── SSE streaming helper ─────────────────────────────────────────────────────
+// ─── SSE helpers ──────────────────────────────────────────────────────────────
 
 function setupSSE(res: import("express").Response) {
   res.setHeader("Content-Type", "text/event-stream");
@@ -153,69 +280,27 @@ function setupSSE(res: import("express").Response) {
   res.flushHeaders();
 }
 
-function sseChunk(data: object): string {
-  return `data: ${JSON.stringify(data)}\n\n`;
+function sseChunk(id: string, model: string, created: number, delta: object, finishReason: string | null): string {
+  return `data: ${JSON.stringify({
+    id, object: "chat.completion.chunk", created, model,
+    system_fingerprint: SYSTEM_FINGERPRINT,
+    choices: [{ index: 0, delta, logprobs: null, finish_reason: finishReason }],
+  })}\n\n`;
 }
 
-/**
- * Stream a complete response string as OpenAI-compatible SSE chunks.
- * Splits on natural token boundaries (words + punctuation).
- */
-async function streamResponse(
-  res: import("express").Response,
-  completionId: string,
-  model: string,
-  created: number,
-  content: string,
-  finishReason: string,
-  includeUsage: boolean,
-  promptTokens: number,
-  completionTokens: number,
-) {
-  // Opening chunk — role delta
-  res.write(sseChunk({
-    id: completionId, object: "chat.completion.chunk", created, model,
+function sseUsageChunk(id: string, model: string, created: number, promptTokens: number, completionTokens: number): string {
+  return `data: ${JSON.stringify({
+    id, object: "chat.completion.chunk", created, model,
     system_fingerprint: SYSTEM_FINGERPRINT,
-    choices: [{ index: 0, delta: { role: "assistant", content: "" }, logprobs: null, finish_reason: null }],
-  }));
-
-  // Token chunks — split by word boundaries keeping punctuation with preceding token
-  const tokens = content.match(/\S+\s*/g) ?? [];
-  for (const token of tokens) {
-    res.write(sseChunk({
-      id: completionId, object: "chat.completion.chunk", created, model,
-      system_fingerprint: SYSTEM_FINGERPRINT,
-      choices: [{ index: 0, delta: { content: token }, logprobs: null, finish_reason: null }],
-    }));
-    // Realistic pacing: ~20ms per token
-    await new Promise((r) => setTimeout(r, 20));
-  }
-
-  // Final chunk — finish_reason
-  res.write(sseChunk({
-    id: completionId, object: "chat.completion.chunk", created, model,
-    system_fingerprint: SYSTEM_FINGERPRINT,
-    choices: [{ index: 0, delta: {}, logprobs: null, finish_reason: finishReason }],
-  }));
-
-  // Usage chunk (only when stream_options.include_usage = true)
-  if (includeUsage) {
-    res.write(sseChunk({
-      id: completionId, object: "chat.completion.chunk", created, model,
-      system_fingerprint: SYSTEM_FINGERPRINT,
-      choices: [],
-      usage: {
-        prompt_tokens: promptTokens,
-        completion_tokens: completionTokens,
-        total_tokens: promptTokens + completionTokens,
-        completion_tokens_details: { reasoning_tokens: 0, accepted_prediction_tokens: 0, rejected_prediction_tokens: 0 },
-        prompt_tokens_details: { cached_tokens: 0, audio_tokens: 0 },
-      },
-    }));
-  }
-
-  res.write("data: [DONE]\n\n");
-  res.end();
+    choices: [],
+    usage: {
+      prompt_tokens: promptTokens,
+      completion_tokens: completionTokens,
+      total_tokens: promptTokens + completionTokens,
+      prompt_tokens_details: { cached_tokens: 0, audio_tokens: 0 },
+      completion_tokens_details: { reasoning_tokens: 0, accepted_prediction_tokens: 0, rejected_prediction_tokens: 0 },
+    },
+  })}\n\n`;
 }
 
 // ─── Message normalisation ────────────────────────────────────────────────────
@@ -226,10 +311,8 @@ function normaliseMessages(messages: OpenAIMessage[]): Array<{ role: string; con
     if (typeof m.content === "string") {
       content = m.content;
     } else if (Array.isArray(m.content)) {
-      // Multimodal: extract text parts only (images not supported)
-      content = m.content.filter((p) => p.type === "text").map((p) => p.text ?? "").join("\n");
+      content = m.content.filter((p) => p.type === "text").map((p) => (p as { text?: string }).text ?? "").join("\n");
     }
-    // If the message has tool_calls, serialise them as content for Qwen
     if (m.tool_calls && m.tool_calls.length > 0 && !content) {
       content = JSON.stringify(m.tool_calls);
     }
@@ -237,72 +320,99 @@ function normaliseMessages(messages: OpenAIMessage[]): Array<{ role: string; con
   });
 }
 
-// ─── Build a single OpenAI completion choice ─────────────────────────────────
+// ─── Stop sequence / tool detection ──────────────────────────────────────────
 
-function buildChoice(
-  index: number,
-  content: string,
-  finishReason: string,
-  includeLogprobs: boolean,
-  tools?: ChatCompletionRequest["tools"],
-): object {
-  // Detect tool call JSON in response
-  let toolCalls: ToolCall[] | null = null;
-  let finalContent: string | null = content;
-  let finalFinishReason = finishReason;
-
-  if (tools && tools.length > 0 && finishReason !== "stop") {
-    // Model may return function call as JSON
+function applyStop(content: string, stop: string | string[] | null | undefined): { content: string; truncated: boolean } {
+  if (!stop) return { content, truncated: false };
+  const stops = Array.isArray(stop) ? stop : [stop];
+  let earliest = content.length;
+  for (const s of stops) {
+    if (!s) continue;
+    const idx = content.indexOf(s);
+    if (idx !== -1 && idx < earliest) earliest = idx;
   }
-
-  // Try to detect if model returned a function call in JSON format
-  if (tools && tools.length > 0) {
-    const trimmed = content.trim();
-    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
-      try {
-        const parsed = JSON.parse(trimmed);
-        const fn = tools[0]?.function;
-        if (fn && parsed) {
-          toolCalls = [{
-            id: `call_${randomUUID().replace(/-/g, "").slice(0, 24)}`,
-            type: "function",
-            function: { name: fn.name, arguments: JSON.stringify(parsed) },
-          }];
-          finalContent = null;
-          finalFinishReason = "tool_calls";
-        }
-      } catch { /* not a valid JSON tool call */ }
-    }
-  }
-
-  return {
-    index,
-    message: {
-      role: "assistant",
-      content: finalContent,
-      refusal: null,
-      tool_calls: toolCalls,
-      annotations: [],
-    },
-    logprobs: includeLogprobs ? { content: null } : null,
-    finish_reason: finalFinishReason,
-  };
+  return earliest < content.length
+    ? { content: content.slice(0, earliest), truncated: true }
+    : { content, truncated: false };
 }
 
-// ─── Persist session ──────────────────────────────────────────────────────────
+function detectToolCalls(raw: string, tools: ChatCompletionRequest["tools"]): ToolCall[] | null {
+  if (!tools || tools.length === 0) return null;
+  const trimmed = raw.trim().replace(/```(?:json)?/gi, "").trim();
+
+  // Walk string finding JSON objects with "tool_calls"
+  const allCalls: ToolCall[] = [];
+  let searchFrom = 0;
+  while (searchFrom < trimmed.length) {
+    const blockStart = trimmed.indexOf("{", searchFrom);
+    if (blockStart === -1) break;
+    let depth = 0;
+    let blockEnd = -1;
+    for (let i = blockStart; i < trimmed.length; i++) {
+      if (trimmed[i] === "{") depth++;
+      else if (trimmed[i] === "}") {
+        depth--;
+        if (depth === 0) { blockEnd = i; break; }
+      }
+    }
+    if (blockEnd === -1) break;
+    const candidate = trimmed.slice(blockStart, blockEnd + 1);
+    if (candidate.includes('"tool_calls"')) {
+      try {
+        const parsed = JSON.parse(candidate) as { tool_calls?: Array<{ name: string; arguments: unknown }> };
+        if (Array.isArray(parsed.tool_calls) && parsed.tool_calls.length > 0) {
+          for (const tc of parsed.tool_calls) {
+            if (!tc.name) continue;
+            allCalls.push({
+              id: `call_${randomUUID().replace(/-/g, "").slice(0, 20)}`,
+              type: "function",
+              function: {
+                name: tc.name,
+                arguments: typeof tc.arguments === "string" ? tc.arguments : JSON.stringify(tc.arguments ?? {}),
+              },
+            });
+          }
+        }
+      } catch { /* skip malformed */ }
+    }
+    searchFrom = blockEnd + 1;
+  }
+  return allCalls.length > 0 ? allCalls : null;
+}
+
+function injectToolPrompt(messages: Array<{ role: string; content: string }>, tools: ChatCompletionRequest["tools"]): Array<{ role: string; content: string }> {
+  if (!tools || tools.length === 0) return messages;
+  const defs = tools.map(t => {
+    const f = t.function;
+    return `- ${f.name}: ${f.description ?? "(no description)"} | params: ${JSON.stringify(f.parameters ?? {})}`;
+  }).join("\n");
+
+  const systemBlock = `You have access to external tools. When a tool is needed, output ONLY a single raw JSON:
+{"tool_calls":[{"name":"TOOL_NAME","arguments":{...}}]}
+Do NOT output anything else when calling tools. When not calling a tool, respond normally in plain text.
+
+AVAILABLE TOOLS:\n${defs}`;
+
+  const first = messages[0];
+  if (first?.role === "system") {
+    return [{ role: "system", content: `${first.content}\n\n${systemBlock}` }, ...messages.slice(1)];
+  }
+  return [{ role: "system", content: systemBlock }, ...messages];
+}
+
+// ─── Session persistence ──────────────────────────────────────────────────────
 
 async function persistSession(
   conversationId: string,
   model: string,
   requestMessages: OpenAIMessage[],
   assistantContent: string,
-  thinking: string | null | undefined,
   existingSession?: typeof chatSessionsTable.$inferSelect,
 ) {
   const now = new Date().toISOString();
   const newMsgs = [
     ...requestMessages.map((m) => ({ ...m, timestamp: now })),
-    { role: "assistant", content: assistantContent, thinking: thinking ?? undefined, timestamp: now },
+    { role: "assistant", content: assistantContent, timestamp: now },
   ];
   const updatedMessages = existingSession
     ? [...(existingSession.messages as object[]), ...newMsgs]
@@ -336,7 +446,7 @@ router.post("/chat/completions", async (req, res) => {
 
   const body = req.body as ChatCompletionRequest;
 
-  // 2. Validate required fields
+  // 2. Validate
   if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
     res.status(400).json({
       error: { message: "'messages' is required and must be a non-empty array", type: "invalid_request_error", param: "messages", code: "invalid_value" },
@@ -344,39 +454,24 @@ router.post("/chat/completions", async (req, res) => {
     return;
   }
 
-  const model          = body.model ?? "qwen-plus";
-  const n              = Math.max(1, Math.min(body.n ?? 1, 10));
-  const isStream       = body.stream === true;
-  const includeUsage   = body.stream_options?.include_usage === true;
+  const _rawModel     = body.model ?? "qwen3-235b-a22b";
+  const model         = resolveModel(_rawModel);
+  const n             = Math.max(1, Math.min(body.n ?? 1, 4));
+  const isStream      = body.stream === true;
+  const includeUsage  = body.stream_options?.include_usage === true;
   const conversationId = body.conversation_id ?? null;
-  const startTime      = Date.now();
+  const startTime     = Date.now();
+  const temperature   = typeof body.temperature === "number" ? Math.max(0, Math.min(2, body.temperature)) : 0.7;
+  const _max          = body.max_completion_tokens ?? body.max_tokens;
+  const _topP         = body.top_p;
+  const _stop         = body.stop;
+  const hasTools      = (body.tools?.length ?? 0) > 0 && body.tool_choice !== "none";
 
-  // 3. Build generation params
-  const genParams: QwenGenerationParams = {
-    temperature:      body.temperature,
-    topP:             body.top_p,
-    maxTokens:        body.max_completion_tokens ?? body.max_tokens,
-    stop:             body.stop,
-    presencePenalty:  body.presence_penalty,
-    frequencyPenalty: body.frequency_penalty,
-    seed:             body.seed,
-    responseFormat:   body.response_format as QwenGenerationParams["responseFormat"],
-    tools:            body.tools as QwenGenerationParams["tools"],
-    toolChoice:       body.tool_choice as QwenGenerationParams["toolChoice"],
-    reasoningEffort:  body.reasoning_effort,
-  };
-
-  // 4. Get token from pool
-  const midtoken = await getPooledMidtoken();
-  if (!midtoken) {
-    res.status(503).json({
-      error: { message: "Gateway token pool is exhausted. Please retry later.", type: "gateway_error", code: "token_pool_empty" },
-    });
-    return;
-  }
+  const completionId = `chatcmpl-${randomUUID().replace(/-/g, "").slice(0, 29)}`;
+  const created      = Math.floor(Date.now() / 1000);
 
   try {
-    // 5. Load or create conversation session
+    // 3. Load or create conversation session
     let chatId = conversationId;
     let session: typeof chatSessionsTable.$inferSelect | undefined;
     let historyMessages: Array<{ role: string; content: string }> = [];
@@ -385,161 +480,307 @@ router.post("/chat/completions", async (req, res) => {
       const rows = await db.select().from(chatSessionsTable).where(eq(chatSessionsTable.conversationId, chatId));
       session = rows[0];
       if (session && Array.isArray(session.messages)) {
-        historyMessages = (session.messages as Array<{ role: string; content: string }>);
+        historyMessages = session.messages as Array<{ role: string; content: string }>;
       }
-    } else {
-      const createResult = await createChat(midtoken, model);
-      chatId = createResult.chatId ?? randomUUID();
     }
 
-    // 6. Build message array
+    // 4. Normalise messages
     const normalisedRequest = normaliseMessages(body.messages);
     const allMessages = historyMessages.length > 0
       ? [...historyMessages, ...normalisedRequest.filter((m) => m.role !== "system")]
       : normalisedRequest;
 
-    // Add tools as system instruction if present and Qwen doesn't natively support them
-    let augmentedMessages = allMessages;
-    if (body.tools && body.tools.length > 0 && body.tool_choice !== "none") {
-      const toolsDesc = body.tools.map((t) =>
-        `Function: ${t.function.name}\nDescription: ${t.function.description ?? ""}\nParameters: ${JSON.stringify(t.function.parameters ?? {})}`
-      ).join("\n\n");
-      const toolSystemMsg = {
-        role: "system",
-        content: `You have access to the following functions. When the user's request requires calling one, respond with ONLY a JSON object matching the function's parameter schema — no prose, no markdown.\n\n${toolsDesc}`,
-      };
-      const hasSystem = augmentedMessages.some((m) => m.role === "system");
-      augmentedMessages = hasSystem
-        ? augmentedMessages.map((m) => m.role === "system" ? { ...m, content: m.content + "\n\n" + toolSystemMsg.content } : m)
-        : [toolSystemMsg, ...augmentedMessages];
-    }
+    const augmentedMessages = hasTools ? injectToolPrompt(allMessages, body.tools) : allMessages;
 
-    // 7. Make n requests (parallel if n > 1)
-    const requests = Array.from({ length: n }, () =>
-      chatCompletions(midtoken, model, augmentedMessages, chatId!, genParams)
-    );
-    const results = await Promise.all(requests);
-
-    // Check for token failure (token is from pool; pool refreshes automatically — no manual mark-failed needed)
-    const firstFailed = results.find((r) => !r.success && r.code === "TOKEN_INVALID");
-    if (firstFailed) {
-      await recordRequest(false, Date.now() - startTime, model);
-      res.status(500).json({
-        error: { message: firstFailed.error ?? "Gateway token error", type: "gateway_error", code: "token_invalid" },
+    // 5. Get auth token or midtoken
+    const sessionToken = getQwenSessionToken();
+    const midtoken = sessionToken ? "" : await getPooledMidtoken();
+    if (!sessionToken && !midtoken) {
+      res.status(503).json({
+        error: { message: "Gateway token pool is exhausted. Please retry later.", type: "gateway_error", code: "token_pool_empty" },
       });
       return;
     }
 
-    const firstResult = results[0];
-    if (!firstResult.success) {
-      await recordRequest(false, Date.now() - startTime, model);
-      res.status(500).json({
-        error: { message: firstResult.error ?? "Gateway error", type: "gateway_error", code: firstResult.code ?? "internal_error" },
-      });
-      return;
+    // 6. Create chat if no existing session
+    if (!chatId) {
+      chatId = sessionToken
+        ? qwenPyCreate(sessionToken, model)
+        : qwenPyCreate("", model, midtoken);
     }
 
-    // 8. Record stats + update key usage
-    await recordRequest(true, Date.now() - startTime, model);
-    await incrementKeyUsage(auth.keyId);
+    // 7. Build Qwen payload
+    const userPrompt = augmentedMessages.map(m => {
+      if (m.role === "system") return `System: ${m.content}`;
+      if (m.role === "assistant") return `Assistant: ${m.content}`;
+      return `User: ${m.content}`;
+    }).join("\n");
 
-    // 9. Persist session (use first result)
-    try {
-      await persistSession(chatId!, model, body.messages, firstResult.response ?? "", firstResult.thinking, session);
-    } catch { /* non-fatal */ }
+    const qwenPayload = {
+      stream: true,
+      incremental_output: true,
+      chat_id: chatId,
+      chat_mode: "normal",
+      model,
+      temperature,
+      ...(typeof _max === "number" && _max > 0 ? { max_output_tokens: _max } : {}),
+      ...(typeof _topP === "number" ? { top_p: Math.max(0, Math.min(1, _topP)) } : {}),
+      parent_id: null,
+      messages: [{
+        fid: randomUUID(),
+        parentId: null,
+        childrenIds: [],
+        role: "user",
+        content: userPrompt,
+        user_action: "chat",
+        files: [],
+        models: [model],
+        chat_type: "t2t",
+        feature_config: { thinking_enabled: false, output_schema: "phase", thinking_budget: 81920 },
+        sub_chat_type: "t2t",
+      }],
+    };
 
-    // 10. Calculate usage (aggregate across n choices)
-    const promptTokens     = firstResult.promptTokens     ?? Math.ceil(augmentedMessages.reduce((s, m) => s + m.content.length, 0) / 4);
-    const completionTokens = results.reduce((s, r) => s + (r.completionTokens ?? Math.ceil((r.response?.length ?? 0) / 4)), 0);
-    const totalTokens      = promptTokens + completionTokens;
-    const completionId     = `chatcmpl-${randomUUID().replace(/-/g, "").slice(0, 29)}`;
-    const created          = Math.floor(Date.now() / 1000);
+    // 8. Execute request (n parallel for non-streaming)
+    const getBody = () => sessionToken
+      ? qwenPyBody(sessionToken, chatId!, qwenPayload)
+      : qwenPyBody("", chatId!, qwenPayload, midtoken);
 
-    // 11. Streaming response
+    // ── STREAMING path ──────────────────────────────────────────────────────
     if (isStream) {
-      // For n > 1, stream only the first result (OpenAI behaviour for stream + n > 1)
-      const streamResult = results[0];
-      const content      = streamResult.response ?? "";
-      const finishReason = streamResult.finishReason ?? "stop";
-
       setupSSE(res);
-      await streamResponse(res, completionId, model, created, content, finishReason, includeUsage, promptTokens, streamResult.completionTokens ?? Math.ceil(content.length / 4));
+      res.write(sseChunk(completionId, _rawModel, created, { role: "assistant", content: "" }, null));
+
+      const body_str = await getBody();
+      checkQwenWaf(body_str);
+      const { content: rawContent, inputTokens, outputTokens, upstreamError } = parseQwenSSE(body_str);
+
+      if (upstreamError) {
+        res.write(`data: ${JSON.stringify({ error: upstreamError.message })}\n\ndata: [DONE]\n\n`);
+        res.end();
+        await recordRequest(false, Date.now() - startTime, _rawModel);
+        return;
+      }
+
+      const stResult = applyStop(rawContent, _stop);
+      const streamContent = stResult.content;
+      const finishReason = stResult.truncated ? "length" : "stop";
+
+      // Check for tool calls
+      const toolCalls = hasTools ? detectToolCalls(streamContent, body.tools) : null;
+
+      if (toolCalls) {
+        res.write(sseChunk(completionId, _rawModel, created, { role: "assistant", content: null }, null));
+        for (let i = 0; i < toolCalls.length; i++) {
+          const tc = toolCalls[i];
+          res.write(sseChunk(completionId, _rawModel, created, {
+            tool_calls: [{ index: i, id: tc.id, type: "function", function: { name: tc.function.name, arguments: "" } }],
+          }, null));
+          const args = tc.function.arguments;
+          const chunkSize = 20;
+          for (let j = 0; j < args.length; j += chunkSize) {
+            res.write(sseChunk(completionId, _rawModel, created, {
+              tool_calls: [{ index: i, function: { arguments: args.slice(j, j + chunkSize) } }],
+            }, null));
+          }
+        }
+        res.write(sseChunk(completionId, _rawModel, created, {}, "tool_calls"));
+      } else {
+        // Stream content word by word
+        const words = streamContent.match(/\S+\s*/g) ?? [];
+        for (const word of words) {
+          if (word) res.write(sseChunk(completionId, _rawModel, created, { content: word }, null));
+        }
+        res.write(sseChunk(completionId, _rawModel, created, {}, finishReason));
+      }
+
+      if (includeUsage) res.write(sseUsageChunk(completionId, _rawModel, created, inputTokens, outputTokens));
+      res.write("data: [DONE]\n\n");
+      res.end();
+
+      await recordRequest(true, Date.now() - startTime, _rawModel);
+      await incrementKeyUsage(auth.keyId);
+      try { await persistSession(chatId!, model, body.messages, streamContent, session); } catch { /* non-fatal */ }
       return;
     }
 
-    // 12. Non-streaming response — full OpenAI schema
-    const choices = results.map((r, idx) =>
-      buildChoice(idx, r.response ?? "", r.finishReason ?? "stop", body.logprobs === true, body.tools ?? undefined)
-    );
+    // ── NON-STREAMING path ───────────────────────────────────────────────────
+    const bodies = await Promise.all(Array.from({ length: n }, () => getBody()));
+    const parsed = bodies.map(b => {
+      checkQwenWaf(b);
+      return parseQwenSSE(b);
+    });
+
+    const firstParsed = parsed[0];
+    if (firstParsed.upstreamError) {
+      await recordRequest(false, Date.now() - startTime, _rawModel);
+      res.status(503).json({
+        error: { message: firstParsed.upstreamError.message, type: "upstream_error", code: firstParsed.upstreamError.code ?? "upstream_error" },
+      });
+      return;
+    }
+
+    const choices = parsed.map((p, idx) => {
+      const stRes = applyStop(p.content, _stop);
+      const content = stRes.content;
+      const finishReason = stRes.truncated ? "length" : "stop";
+      const toolCalls = hasTools ? detectToolCalls(content, body.tools) : null;
+
+      if (toolCalls) {
+        return {
+          index: idx,
+          message: { role: "assistant", content: null, refusal: null, tool_calls: toolCalls },
+          logprobs: null,
+          finish_reason: "tool_calls",
+        };
+      }
+      return {
+        index: idx,
+        message: { role: "assistant", content, refusal: null, tool_calls: null },
+        logprobs: body.logprobs ? { content: null } : null,
+        finish_reason: finishReason,
+      };
+    });
+
+    const promptTokens     = firstParsed.inputTokens  || Math.ceil(augmentedMessages.reduce((s, m) => s + m.content.length, 0) / 4);
+    const completionTokens = parsed.reduce((s, p) => s + (p.outputTokens || Math.ceil(p.content.length / 4)), 0);
+
+    await recordRequest(true, Date.now() - startTime, _rawModel);
+    await incrementKeyUsage(auth.keyId);
+    try { await persistSession(chatId!, model, body.messages, parsed[0].content, session); } catch { /* non-fatal */ }
 
     res.json({
       id:                 completionId,
       object:             "chat.completion",
       created,
-      model,
+      model:              _rawModel,
       system_fingerprint: SYSTEM_FINGERPRINT,
       service_tier:       body.service_tier ?? "default",
       choices,
       usage: {
         prompt_tokens:     promptTokens,
         completion_tokens: completionTokens,
-        total_tokens:      totalTokens,
-        completion_tokens_details: {
-          reasoning_tokens:              firstResult.thinking ? Math.ceil((firstResult.thinking.length ?? 0) / 4) : 0,
-          accepted_prediction_tokens:    0,
-          rejected_prediction_tokens:    0,
-        },
-        prompt_tokens_details: {
-          cached_tokens: 0,
-          audio_tokens:  0,
-        },
+        total_tokens:      promptTokens + completionTokens,
+        prompt_tokens_details: { cached_tokens: 0, audio_tokens: 0 },
+        completion_tokens_details: { reasoning_tokens: 0, accepted_prediction_tokens: 0, rejected_prediction_tokens: 0 },
       },
-      // Non-standard gateway extensions (ignored by standard clients)
-      x_gateway: {
-        conversation_id: chatId,
-        thinking:        firstResult.thinking ?? null,
-      },
+      x_gateway: { conversation_id: chatId },
     });
 
   } catch (err) {
-    req.log.error({ err }, "v1 chat/completions unhandled error");
-    await recordRequest(false, Date.now() - startTime, model);
-    res.status(500).json({
-      error: { message: "Internal gateway error", type: "gateway_error", code: "internal_error" },
-    });
+    logger.error({ err }, "v1/chat/completions error");
+    const errMsg = err instanceof Error ? err.message : "Internal server error";
+    const isWaf = errMsg.includes("WAF") || errMsg.includes("QWEN_SESSION_TOKEN");
+    const message = isWaf ? errMsg : "Internal gateway error";
+    const type    = isWaf ? "service_unavailable" : "server_error";
+    const code    = isWaf ? "qwen_waf_blocked" : "internal_error";
+    await recordRequest(false, Date.now() - startTime, _rawModel ?? "unknown");
+    if (!res.headersSent) {
+      res.status(isWaf ? 503 : 500).json({ error: { message, type, code } });
+    } else {
+      res.write(`data: ${JSON.stringify({ error: message })}\n\ndata: [DONE]\n\n`);
+      res.end();
+    }
   }
 });
 
 // ─── GET /v1/models ───────────────────────────────────────────────────────────
 
-router.get("/models", (req, res) => {
-  const auth = req.headers.authorization;
-  // Models endpoint is public (like OpenAI) — just log if key present
-  const created = Math.floor(Date.now() / 1000);
-  res.json({
-    object: "list",
-    data: MODELS.map((m) => ({
-      id:         m.id,
-      object:     "model",
-      created,
-      owned_by:   "qwen-gateway",
-      permission: [],
-      root:       m.id,
-      parent:     null,
-    })),
-  });
+router.get("/models", (_req, res) => {
+  res.json({ object: "list", data: MODELS });
 });
 
 // ─── GET /v1/models/:model ────────────────────────────────────────────────────
 
 router.get("/models/:model", (req, res) => {
-  const created = Math.floor(Date.now() / 1000);
-  const m = MODELS.find((x) => x.id === req.params.model);
-  if (!m) {
-    res.status(404).json({ error: { message: `Model '${req.params.model}' not found`, type: "invalid_request_error", code: "model_not_found" } });
+  const paramModel = String(req.params.model);
+  const found = MODELS.find(m => m.id === paramModel || resolveModel(paramModel) === m.id);
+  if (!found) {
+    res.status(404).json({
+      error: { message: `The model '${req.params.model}' does not exist`, type: "invalid_request_error", param: "model", code: "model_not_found" },
+    });
     return;
   }
-  res.json({ id: m.id, object: "model", created, owned_by: "qwen-gateway", permission: [], root: m.id, parent: null });
+  res.json(found);
+});
+
+// ─── POST /v1/completions (legacy text completions) ───────────────────────────
+
+router.post("/completions", async (req, res) => {
+  const auth = await resolveApiKey(req.headers.authorization);
+  if (!auth.ok) {
+    res.status(auth.statusCode).json({
+      error: { message: auth.error, type: "invalid_request_error", code: "invalid_api_key" },
+    });
+    return;
+  }
+
+  const { model: _rawModel = "qwen3-235b-a22b", prompt, max_tokens, temperature: _temp, stop: _stop } = req.body as {
+    model?: string; prompt?: string | string[]; max_tokens?: number; temperature?: number; stop?: string | string[];
+  };
+
+  if (!prompt) {
+    res.status(400).json({ error: { message: "prompt is required", type: "invalid_request_error", param: "prompt", code: "missing_required_parameter" } });
+    return;
+  }
+
+  const promptText = Array.isArray(prompt) ? prompt.join("") : String(prompt);
+  const model = resolveModel(_rawModel);
+  const temperature = typeof _temp === "number" ? Math.max(0, Math.min(2, _temp)) : 0.7;
+  const startTime = Date.now();
+
+  try {
+    const sessionToken = getQwenSessionToken();
+    const midtoken = sessionToken ? "" : await getPooledMidtoken();
+
+    const chatId = sessionToken
+      ? qwenPyCreate(sessionToken, model)
+      : qwenPyCreate("", model, midtoken);
+
+    const qwenPayload = {
+      stream: true, incremental_output: true, chat_id: chatId, chat_mode: "normal",
+      model, temperature, parent_id: null,
+      messages: [{
+        fid: randomUUID(), parentId: null, childrenIds: [], role: "user",
+        content: promptText, user_action: "chat", files: [], models: [model],
+        chat_type: "t2t", feature_config: { thinking_enabled: false, output_schema: "phase", thinking_budget: 81920 }, sub_chat_type: "t2t",
+      }],
+    };
+
+    const rawBody = sessionToken
+      ? await qwenPyBody(sessionToken, chatId, qwenPayload)
+      : await qwenPyBody("", chatId, qwenPayload, midtoken);
+
+    checkQwenWaf(rawBody);
+    const { content: rawContent, inputTokens, outputTokens, upstreamError } = parseQwenSSE(rawBody);
+
+    if (upstreamError) {
+      await recordRequest(false, Date.now() - startTime, _rawModel);
+      res.status(503).json({ error: { message: upstreamError.message, type: "upstream_error", code: upstreamError.code ?? "upstream_error" } });
+      return;
+    }
+
+    const stRes = applyStop(rawContent, _stop);
+    const content = stRes.content;
+    const finishReason = stRes.truncated ? "length" : "stop";
+
+    await recordRequest(true, Date.now() - startTime, _rawModel);
+    await incrementKeyUsage(auth.keyId);
+
+    res.json({
+      id: `cmpl-${randomUUID().replace(/-/g, "").slice(0, 29)}`,
+      object: "text_completion",
+      created: Math.floor(Date.now() / 1000),
+      model: _rawModel,
+      choices: [{ text: content, index: 0, logprobs: null, finish_reason: finishReason }],
+      usage: { prompt_tokens: inputTokens || Math.ceil(promptText.length / 4), completion_tokens: outputTokens || Math.ceil(content.length / 4), total_tokens: (inputTokens || 0) + (outputTokens || 0) },
+    });
+  } catch (err) {
+    logger.error({ err }, "v1/completions error");
+    await recordRequest(false, Date.now() - startTime, _rawModel ?? "unknown");
+    const errMsg = err instanceof Error ? err.message : "Internal server error";
+    res.status(500).json({ error: { message: errMsg, type: "server_error", code: "internal_error" } });
+  }
 });
 
 export default router;
