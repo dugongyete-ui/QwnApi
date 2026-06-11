@@ -1,12 +1,26 @@
 import { spawn } from "child_process";
-import { join, dirname } from "path";
-import { fileURLToPath } from "url";
+import path from "path";
 import { logger } from "./logger";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const PYTHON_SCRIPT = join(__dirname, "..", "..", "qwen_engine.py");
+// process.cwd() is the artifact directory (artifacts/api-server/) at runtime.
+const PYTHON_SCRIPT = path.resolve(process.cwd(), "qwen_engine.py");
+const PYTHON_BIN = "python3";
 
-interface QwenInput {
+export interface QwenGenerationParams {
+  temperature?: number | null;
+  topP?: number | null;
+  maxTokens?: number | null;
+  stop?: string | string[] | null;
+  presencePenalty?: number | null;
+  frequencyPenalty?: number | null;
+  seed?: number | null;
+  responseFormat?: { type: string; json_schema?: object } | null;
+  tools?: Array<{ type: string; function: object }> | null;
+  toolChoice?: string | object | null;
+  reasoningEffort?: string | null;
+}
+
+interface QwenInput extends QwenGenerationParams {
   action: "create_chat" | "chat_completions";
   midtoken: string;
   model: string;
@@ -14,31 +28,31 @@ interface QwenInput {
   chatId?: string;
 }
 
-interface QwenResult {
+export interface QwenResult {
   success: boolean;
   error?: string;
   code?: string;
+  status?: number;
   chatId?: string;
   response?: string;
   thinking?: string | null;
-  tokenUsage?: number | null;
+  finishReason?: string;
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens?: number;
 }
 
 async function callPython(input: QwenInput): Promise<QwenResult> {
   return new Promise((resolve) => {
-    const py = spawn("python3", [PYTHON_SCRIPT], {
+    const py = spawn(PYTHON_BIN, [PYTHON_SCRIPT], {
       stdio: ["pipe", "pipe", "pipe"],
     });
 
     let stdout = "";
     let stderr = "";
 
-    py.stdout.on("data", (d) => {
-      stdout += d.toString();
-    });
-    py.stderr.on("data", (d) => {
-      stderr += d.toString();
-    });
+    py.stdout.on("data", (d) => { stdout += d.toString(); });
+    py.stderr.on("data", (d) => { stderr += d.toString(); });
 
     py.on("close", (code) => {
       if (stderr) logger.debug({ stderr }, "Python stderr");
@@ -71,6 +85,7 @@ export async function chatCompletions(
   model: string,
   messages: Array<{ role: string; content: string }>,
   chatId: string,
+  params: QwenGenerationParams = {},
 ): Promise<QwenResult> {
-  return callPython({ action: "chat_completions", midtoken, model, messages, chatId });
+  return callPython({ action: "chat_completions", midtoken, model, messages, chatId, ...params });
 }

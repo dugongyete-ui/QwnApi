@@ -1,19 +1,28 @@
+/**
+ * bx-umidtoken pool with Python sidecar-backed refresh.
+ * Uses curl_cffi (Chrome impersonation) to bypass Alibaba TLS fingerprinting
+ * — the same technique we use for Qwen chat requests.
+ *
+ * Manual seeding is also available via addToken() for tokens extracted directly
+ * from a browser session.
+ */
+
+import { spawnSync } from "child_process";
+import path from "path";
 import { logger } from "./logger";
+
+// process.cwd() is the artifact directory (artifacts/api-server/) when the server runs.
+// This works in both dev (src/) and prod (dist/) because CWD never changes.
+const SIDECAR_PATH = path.resolve(process.cwd(), "qwen_engine.py");
+const PYTHON_BIN = "python3";
 
 interface Token {
   value: string;
   healthy: boolean;
   failCount: number;
   lastUsed: number;
+  source: "auto" | "manual";
 }
-
-const USER_AGENTS = [
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
-];
 
 class TokenPool {
   private tokens: Token[] = [];
@@ -22,91 +31,102 @@ class TokenPool {
   private nextRefresh: Date | null = null;
   private rotationCount = 0;
   private refreshInterval: NodeJS.Timeout | null = null;
+  private refreshing = false;
 
   constructor() {
     this.startAutoRefresh();
   }
 
   private startAutoRefresh() {
-    this.refreshTokens().catch((err) =>
-      logger.warn({ err }, "Initial token fetch failed"),
-    );
-    this.refreshInterval = setInterval(
-      () => {
-        this.refreshTokens().catch((err) =>
-          logger.warn({ err }, "Token refresh failed"),
-        );
-      },
-      5 * 60 * 1000,
-    );
+    void this.refreshTokens();
+    this.refreshInterval = setInterval(() => {
+      void this.refreshTokens();
+    }, 5 * 60 * 1000);
   }
 
+  /** Call the Python sidecar with fetch_token action. */
   async refreshTokens() {
-    const uaIndex = Math.floor(Math.random() * USER_AGENTS.length);
-    const ua = USER_AGENTS[uaIndex];
+    if (this.refreshing) return;
+    this.refreshing = true;
     try {
-      const res = await fetch(
-        "https://sg-wum.alibaba.com/w/wu.json?_t=" + Date.now(),
-        {
-          headers: {
-            "User-Agent": ua,
-            Accept: "application/json",
-            Referer: "https://chat.qwen.ai/",
-            Origin: "https://chat.qwen.ai",
-          },
-          signal: AbortSignal.timeout(10000),
-        },
-      );
+      const input = JSON.stringify({ action: "fetch_token" });
+      const result = spawnSync(PYTHON_BIN, [SIDECAR_PATH], {
+        input,
+        encoding: "utf-8",
+        timeout: 20_000,
+        maxBuffer: 1024 * 1024,
+      });
 
-      if (!res.ok) {
-        logger.warn({ status: res.status }, "Token fetch returned non-200");
+      if (result.error) {
+        logger.warn({ err: result.error }, "Token sidecar spawn error");
         return;
       }
 
-      const data = (await res.json()) as { data?: { token?: string } };
-      const token = data?.data?.token;
-      if (!token) {
-        logger.warn({ data }, "No token in response");
+      const stdout = result.stdout?.trim();
+      if (!stdout) {
+        logger.warn({ stderr: result.stderr }, "Token sidecar empty output");
         return;
       }
 
-      const existing = this.tokens.find((t) => t.value === token);
-      if (!existing) {
-        this.tokens.push({ value: token, healthy: true, failCount: 0, lastUsed: 0 });
-        if (this.tokens.length > 20) {
-          this.tokens.shift();
-        }
-      } else {
-        existing.healthy = true;
-        existing.failCount = 0;
+      let data: { success: boolean; token?: string; error?: string; source?: string };
+      try {
+        data = JSON.parse(stdout);
+      } catch {
+        logger.warn({ stdout }, "Token sidecar non-JSON output");
+        return;
       }
 
+      if (!data.success || !data.token) {
+        logger.warn({ error: data.error }, "Token sidecar: fetch failed");
+        return;
+      }
+
+      this._upsertToken(data.token, "auto");
       this.lastRefreshed = new Date();
       this.nextRefresh = new Date(Date.now() + 5 * 60 * 1000);
-      logger.info({ poolSize: this.tokens.length }, "Token pool refreshed");
+      logger.info({ poolSize: this.tokens.length, source: data.source }, "Token pool refreshed via sidecar");
     } catch (err) {
-      logger.warn({ err }, "Token refresh error");
+      logger.warn({ err }, "Token refresh unexpected error");
+    } finally {
+      this.refreshing = false;
+    }
+  }
+
+  /** Add a token manually (e.g. extracted from browser session). */
+  addToken(token: string): void {
+    this._upsertToken(token.trim(), "manual");
+    logger.info({ poolSize: this.tokens.length }, "Token manually seeded");
+  }
+
+  private _upsertToken(value: string, source: Token["source"]) {
+    const existing = this.tokens.find((t) => t.value === value);
+    if (existing) {
+      existing.healthy = true;
+      existing.failCount = 0;
+    } else {
+      this.tokens.push({ value, healthy: true, failCount: 0, lastUsed: 0, source });
+      if (this.tokens.length > 30) {
+        // Evict oldest auto-generated token first
+        const idx = this.tokens.findIndex((t) => t.source === "auto");
+        if (idx !== -1) this.tokens.splice(idx, 1);
+        else this.tokens.shift();
+      }
     }
   }
 
   getToken(): string | null {
     const healthy = this.tokens.filter((t) => t.healthy);
-    if (healthy.length === 0) {
-      this.tokens.forEach((t) => {
-        t.healthy = true;
-        t.failCount = 0;
-      });
-      if (this.tokens.length === 0) return null;
+    // If all tokens are marked unhealthy, reset and retry
+    if (healthy.length === 0 && this.tokens.length > 0) {
+      this.tokens.forEach((t) => { t.healthy = true; t.failCount = 0; });
     }
-
     const available = this.tokens.filter((t) => t.healthy);
     if (available.length === 0) return null;
-
+    // Round-robin by least recently used
     available.sort((a, b) => a.lastUsed - b.lastUsed);
-    const token = available[0];
+    const token = available[0]!;
     token.lastUsed = Date.now();
     this.rotationCount++;
-
     return token.value;
   }
 
@@ -116,10 +136,10 @@ class TokenPool {
       token.failCount++;
       if (token.failCount >= 3) {
         token.healthy = false;
-        logger.warn({ tokenPreview: tokenValue.slice(0, 8) }, "Token marked unhealthy");
+        logger.warn({ preview: tokenValue.slice(0, 8) }, "Token marked unhealthy");
       }
     }
-    this.refreshTokens().catch(() => {});
+    void this.refreshTokens();
   }
 
   getStatus() {

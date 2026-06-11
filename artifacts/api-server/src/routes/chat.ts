@@ -3,7 +3,7 @@ import { randomUUID } from "crypto";
 import { db } from "@workspace/db";
 import { chatSessionsTable } from "@workspace/db";
 import { eq } from "drizzle-orm";
-import { tokenPool } from "../lib/tokenPool";
+import { getPooledMidtoken } from "../lib/umid-pool";
 import { createChat, chatCompletions } from "../lib/qwenEngine";
 import { gatewayStatsTable, requestLogsTable } from "@workspace/db";
 import { sql } from "drizzle-orm";
@@ -28,7 +28,7 @@ router.post("/chat", async (req, res) => {
   const { prompt, model = "qwen-plus", conversationId } = parsed.data;
   const startTime = Date.now();
 
-  const midtoken = tokenPool.getToken();
+  const midtoken = await getPooledMidtoken();
   if (!midtoken) {
     res.status(503).json({ error: "No available tokens in pool", code: "TOKEN_POOL_EMPTY" });
     return;
@@ -55,9 +55,6 @@ router.post("/chat", async (req, res) => {
     const result = await chatCompletions(midtoken, model, messages, chatId!);
 
     if (!result.success) {
-      if (result.code === "TOKEN_INVALID") {
-        tokenPool.markFailed(midtoken);
-      }
       await recordRequest(false, Date.now() - startTime, model);
       res.status(500).json({ error: result.error ?? "Gateway error", code: result.code });
       return;
@@ -111,7 +108,7 @@ router.post("/chat", async (req, res) => {
       thinking: result.thinking ?? null,
       model,
       conversationId: chatId,
-      tokenUsage: result.tokenUsage ?? null,
+      tokenUsage: result.totalTokens ?? null,
     });
   } catch (err) {
     req.log.error({ err }, "Chat error");

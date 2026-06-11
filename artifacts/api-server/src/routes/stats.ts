@@ -1,8 +1,8 @@
 import { Router } from "express";
 import { db } from "@workspace/db";
 import { gatewayStatsTable, requestLogsTable, apiKeysTable } from "@workspace/db";
-import { eq, gte, count, and } from "drizzle-orm";
-import { tokenPool } from "../lib/tokenPool";
+import { eq, gte, count } from "drizzle-orm";
+import { getPoolStatus, warmPool } from "../lib/umid-pool";
 
 const router = Router();
 
@@ -31,7 +31,7 @@ router.get("/stats", async (req, res) => {
     const successRate = totalRequests > 0 ? successRequests / totalRequests : 0;
     const avgResponseTime = totalRequests > 0 ? totalResponseTime / totalRequests : 0;
 
-    const poolStatus = tokenPool.getStatus();
+    const poolStatus = getPoolStatus();
 
     res.json({
       totalRequests,
@@ -42,8 +42,8 @@ router.get("/stats", async (req, res) => {
       requestsThisHour: Number(hourRows[0]?.cnt ?? 0),
       averageResponseTime: Math.round(avgResponseTime),
       activeApiKeys: Number(activeKeysRows[0]?.cnt ?? 0),
-      tokenPoolSize: poolStatus.total,
-      tokenPoolHealthy: poolStatus.healthy,
+      tokenPoolSize: poolStatus.size,
+      tokenPoolHealthy: poolStatus.entries.filter((e) => e.hasToken).length,
     });
   } catch (err) {
     req.log.error({ err }, "Stats error");
@@ -52,7 +52,13 @@ router.get("/stats", async (req, res) => {
 });
 
 router.get("/token-pool", (_req, res) => {
-  res.json(tokenPool.getStatus());
+  res.json(getPoolStatus());
+});
+
+/** POST /api/token-pool/refresh — trigger a background re-warm of the pool */
+router.post("/token-pool/refresh", (_req, res) => {
+  warmPool();
+  res.json({ ok: true, message: "Pool re-warm triggered", status: getPoolStatus() });
 });
 
 export default router;

@@ -2,11 +2,11 @@
 """
 Qwen Gateway Engine — WAF bypass using curl_cffi for TLS fingerprint spoofing.
 Reads JSON input from stdin, writes JSON result to stdout.
+Supports full OpenAI-compatible generation parameters.
 """
 
 import sys
 import json
-import time
 import uuid
 
 try:
@@ -77,16 +77,73 @@ def create_chat(midtoken: str, model: str) -> dict:
         return {"success": False, "error": str(e), "chatId": str(uuid.uuid4())}
 
 
-def chat_completions(midtoken: str, model: str, messages: list, chat_id: str) -> dict:
+def chat_completions(
+    midtoken: str,
+    model: str,
+    messages: list,
+    chat_id: str,
+    # Generation parameters — passed through to Qwen where supported
+    temperature: float = None,
+    top_p: float = None,
+    max_tokens: int = None,
+    stop=None,
+    presence_penalty: float = None,
+    frequency_penalty: float = None,
+    seed: int = None,
+    response_format: dict = None,
+    tools: list = None,
+    tool_choice=None,
+    reasoning_effort: str = None,
+) -> dict:
     """Send messages and return the AI response."""
+
+    # Build system message for JSON mode
+    final_messages = list(messages)
+    if response_format and response_format.get("type") == "json_object":
+        has_system = any(m.get("role") == "system" for m in final_messages)
+        json_instruction = "You must respond with valid JSON only. Do not include markdown, explanations, or any text outside the JSON object."
+        if has_system:
+            final_messages = [
+                {**m, "content": m["content"] + "\n\n" + json_instruction} if m.get("role") == "system" else m
+                for m in final_messages
+            ]
+        else:
+            final_messages = [{"role": "system", "content": json_instruction}] + final_messages
+
+    # Adjust model for reasoning effort
+    if reasoning_effort in ("high", "medium"):
+        # Map to thinking-capable Qwen models
+        if "qwen3" not in model and "max" not in model:
+            model_override = "qwen3.7-plus"
+        else:
+            model_override = model
+    else:
+        model_override = model
+
     payload = {
-        "model": model,
-        "messages": messages,
+        "model": model_override,
+        "messages": final_messages,
         "stream": False,
         "incremental_output": False,
         "chat_id": chat_id,
         "id": str(uuid.uuid4()),
     }
+
+    # Pass through supported generation parameters
+    if temperature is not None:
+        payload["temperature"] = float(temperature)
+    if top_p is not None:
+        payload["top_p"] = float(top_p)
+    if max_tokens is not None:
+        payload["max_tokens"] = int(max_tokens)
+    if stop is not None:
+        payload["stop"] = stop if isinstance(stop, list) else [stop]
+    if presence_penalty is not None:
+        payload["presence_penalty"] = float(presence_penalty)
+    if frequency_penalty is not None:
+        payload["repetition_penalty"] = 1.0 + float(frequency_penalty)
+    if seed is not None:
+        payload["seed"] = int(seed)
 
     url = f"{QWEN_BASE}/chat/completions"
     headers = get_headers(midtoken)
@@ -98,7 +155,7 @@ def chat_completions(midtoken: str, model: str, messages: list, chat_id: str) ->
                 json=payload,
                 headers=headers,
                 impersonate=DEFAULT_IMPERSONATE,
-                timeout=60,
+                timeout=120,
             )
             raw = resp.text
             status = resp.status_code
@@ -110,7 +167,7 @@ def chat_completions(midtoken: str, model: str, messages: list, chat_id: str) ->
                 method="POST",
             )
             try:
-                with urllib.request.urlopen(req, timeout=60) as r:
+                with urllib.request.urlopen(req, timeout=120) as r:
                     raw = r.read().decode()
                     status = r.status
             except urllib.error.HTTPError as e:
@@ -138,10 +195,16 @@ def chat_completions(midtoken: str, model: str, messages: list, chat_id: str) ->
 
         thinking = ""
         answer = ""
+        finish_reason = "stop"
+        prompt_tokens = 0
+        completion_tokens = 0
+        total_tokens = 0
 
         choices = data.get("choices", [])
         if choices:
-            msg = choices[0].get("message", {})
+            choice = choices[0]
+            finish_reason = choice.get("finish_reason", "stop") or "stop"
+            msg = choice.get("message", {})
             content = msg.get("content", "")
             reasoning = msg.get("reasoning_content", "")
 
@@ -151,6 +214,7 @@ def chat_completions(midtoken: str, model: str, messages: list, chat_id: str) ->
             else:
                 answer = content
 
+        # Fallback for alternative Qwen response shape
         if not answer:
             output = data.get("output", {})
             if isinstance(output, dict):
@@ -160,22 +224,96 @@ def chat_completions(midtoken: str, model: str, messages: list, chat_id: str) ->
                     answer = msg2.get("content", "")
                     thinking = msg2.get("reasoning_content", "")
 
-        token_usage = None
         usage = data.get("usage", {})
         if usage:
-            token_usage = usage.get("total_tokens")
+            prompt_tokens = usage.get("input_tokens") or usage.get("prompt_tokens", 0)
+            completion_tokens = usage.get("output_tokens") or usage.get("completion_tokens", 0)
+            total_tokens = usage.get("total_tokens", prompt_tokens + completion_tokens)
+
+        # Estimate tokens if not provided
+        if not prompt_tokens and final_messages:
+            prompt_tokens = sum(len(m.get("content", "")) // 4 for m in final_messages)
+        if not completion_tokens and answer:
+            completion_tokens = len(answer) // 4
+        if not total_tokens:
+            total_tokens = prompt_tokens + completion_tokens
 
         return {
             "success": True,
             "response": answer or "(empty response)",
             "thinking": thinking or None,
-            "tokenUsage": token_usage,
+            "finishReason": finish_reason,
+            "promptTokens": prompt_tokens,
+            "completionTokens": completion_tokens,
+            "totalTokens": total_tokens,
         }
 
     except json.JSONDecodeError as e:
         return {"success": False, "error": f"JSON parse error: {e}", "code": "PARSE_ERROR"}
     except Exception as e:
         return {"success": False, "error": str(e), "code": "EXCEPTION"}
+
+
+def fetch_token() -> dict:
+    """
+    Fetch a fresh bx-umidtoken from Alibaba's UMI endpoint.
+
+    The response is JavaScript (not JSON), e.g.:
+        try{umx.wu('TOKEN_HERE');}catch(e){}
+        try{__fycb('TOKEN_HERE');}catch(e){}
+
+    We extract the token using a regex on the raw response body.
+    curl_cffi is used when available for better TLS fingerprinting.
+    """
+    import re as _re
+    import time as _time
+
+    sources = [
+        f"https://sg-wum.alibaba.com/w/wu.json?_t={int(_time.time()*1000)}",
+        f"https://ynuf.aliapp.org/w/wu.json?_t={int(_time.time()*1000)}",
+    ]
+
+    headers_base = {
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Origin": "https://chat.qwen.ai",
+        "Referer": "https://chat.qwen.ai/",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    }
+
+    # Regex to extract token from JS like: umx.wu('TOKEN') or __fycb('TOKEN')
+    _token_re = _re.compile(r"(?:umx\.wu|__fycb)\(['\"]([^'\"]+)['\"]")
+
+    def _extract_token(body: str):
+        m = _token_re.search(body)
+        return m.group(1) if m else None
+
+    for url in sources:
+        try:
+            if HAS_CURL_CFFI:
+                resp = cffi_requests.get(
+                    url,
+                    headers=headers_base,
+                    impersonate=DEFAULT_IMPERSONATE,
+                    timeout=15,
+                )
+                if resp.status_code == 200:
+                    token = _extract_token(resp.text)
+                    if token:
+                        return {"success": True, "token": token, "source": url}
+            else:
+                import urllib.request as _ureq
+                req = _ureq.Request(url, headers=headers_base, method="GET")
+                with _ureq.urlopen(req, timeout=15) as r:
+                    body = r.read().decode()
+                    token = _extract_token(body)
+                    if token:
+                        return {"success": True, "token": token, "source": url}
+        except Exception:
+            continue  # try next source
+
+    return {"success": False, "error": "All token sources failed"}
 
 
 def main():
@@ -195,7 +333,25 @@ def main():
     elif action == "chat_completions":
         messages = inp.get("messages", [])
         chat_id = inp.get("chatId", str(uuid.uuid4()))
-        result = chat_completions(midtoken, model, messages, chat_id)
+        result = chat_completions(
+            midtoken=midtoken,
+            model=model,
+            messages=messages,
+            chat_id=chat_id,
+            temperature=inp.get("temperature"),
+            top_p=inp.get("topP"),
+            max_tokens=inp.get("maxTokens"),
+            stop=inp.get("stop"),
+            presence_penalty=inp.get("presencePenalty"),
+            frequency_penalty=inp.get("frequencyPenalty"),
+            seed=inp.get("seed"),
+            response_format=inp.get("responseFormat"),
+            tools=inp.get("tools"),
+            tool_choice=inp.get("toolChoice"),
+            reasoning_effort=inp.get("reasoningEffort"),
+        )
+    elif action == "fetch_token":
+        result = fetch_token()
     else:
         result = {"success": False, "error": f"Unknown action: {action}"}
 
