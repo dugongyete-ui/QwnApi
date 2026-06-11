@@ -1,7 +1,14 @@
 import { logger } from "./logger";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, resolve } from "node:path";
 
 const UMID_URL = "https://sg-wum.alibaba.com/w/wu.json";
 const TOKEN_TTL = 3600_000; // 1 hour
+
+// Path to the token cache file written by warmup_tokens.py.
+// Lives one level ABOVE dist/ so it survives build cleans.
+const _cacheFile = resolve(dirname(fileURLToPath(import.meta.url)), "..", "token_cache.json");
 
 const USER_AGENTS: string[] = [
   // Chrome on Windows (various versions)
@@ -573,6 +580,33 @@ let _initPromise: Promise<void> | null = null;
 let _firstBatchResolve: (() => void) | null = null;
 const _firstBatchReady = new Promise<void>((resolve) => { _firstBatchResolve = resolve; });
 
+/**
+ * Try to load tokens from the disk cache written by warmup_tokens.py.
+ * Tokens still within their TTL window are injected directly into the pool,
+ * giving instant availability on server (re)start without a network round-trip.
+ */
+function loadDiskCache(): number {
+  try {
+    const raw = readFileSync(_cacheFile, "utf-8");
+    const data = JSON.parse(raw) as { tokens?: Array<{ ua: string; token: string; ts: number }> };
+    const now = Date.now();
+    let loaded = 0;
+    for (const entry of data.tokens ?? []) {
+      if (!entry.token) continue;
+      const age = now - entry.ts;
+      if (age >= TOKEN_TTL) continue; // expired — skip
+      _pool.push({ token: entry.token, ts: entry.ts, ua: entry.ua });
+      loaded++;
+    }
+    if (loaded > 0) {
+      logger.info({ loaded, file: _cacheFile }, "Loaded bx-umidtoken pool from disk cache");
+    }
+    return loaded;
+  } catch {
+    return 0; // cache absent or unreadable — fall back to network fetch
+  }
+}
+
 async function fetchToken(userAgent: string): Promise<string> {
   try {
     const res = await fetch(UMID_URL, {
@@ -607,11 +641,30 @@ async function initPool(): Promise<void> {
   _initPromise = (async () => {
     const poolSize = USER_AGENTS.length;
     logger.info({ size: poolSize }, "Initializing bx-umidtoken pool (batched)");
-    const BATCH = 10;
-    for (let i = 0; i < USER_AGENTS.length; i += BATCH) {
-      await fetchBatch(USER_AGENTS.slice(i, i + BATCH), i === 0);
+
+    // Fast-path: load valid tokens from disk cache written by warmup_tokens.py.
+    // If we get at least one token we can signal _firstBatchReady immediately,
+    // removing cold-start latency entirely on server (re)start.
+    const cached = loadDiskCache();
+    if (cached > 0 && _firstBatchResolve) {
+      _firstBatchResolve();
+      _firstBatchResolve = null;
     }
-    // Ensure _firstBatchReady is resolved even if all batches fetched 0 tokens
+
+    // Determine which UAs are already covered by the cache so we don't
+    // double-fetch; any UA not in the cache will be refreshed from network.
+    const cachedUAs = new Set(_pool.map((e) => e.ua));
+    const missing = USER_AGENTS.filter((ua) => !cachedUAs.has(ua));
+
+    if (missing.length > 0) {
+      logger.info({ cached, missing: missing.length }, "Fetching remaining tokens from network");
+      const BATCH = 10;
+      for (let i = 0; i < missing.length; i += BATCH) {
+        await fetchBatch(missing.slice(i, i + BATCH), cached === 0 && i === 0);
+      }
+    }
+
+    // Ensure _firstBatchReady is resolved even if all fetches returned 0 tokens
     if (_firstBatchResolve) { _firstBatchResolve(); _firstBatchResolve = null; }
     logger.info({ fetched: _pool.length, target: poolSize }, "bx-umidtoken pool ready");
   })();
