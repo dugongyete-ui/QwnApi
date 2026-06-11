@@ -3,13 +3,21 @@ info:
   # Do not change the title, if the title changes, the import paths will be broken
   title: Api
   version: 0.1.0
-  description: API specification
+  description: Chat Gateway API — Qwen AI proxy with API key management
 servers:
   - url: /api
     description: Base API path
 tags:
   - name: health
     description: Health operations
+  - name: chat
+    description: Chat operations
+  - name: keys
+    description: API key management
+  - name: stats
+    description: Gateway statistics
+  - name: history
+    description: Chat history
 paths:
   /healthz:
     get:
@@ -24,6 +32,228 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+
+  /chat:
+    post:
+      operationId: sendChat
+      tags: [chat]
+      summary: Send a chat message
+      description: Send a message to Qwen AI and receive a response
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatRequest"
+      responses:
+        "200":
+          description: Chat response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatResponse"
+        "401":
+          description: Invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Gateway error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /stats:
+    get:
+      operationId: getStats
+      tags: [stats]
+      summary: Get gateway statistics
+      description: Returns usage statistics for the gateway
+      responses:
+        "200":
+          description: Gateway statistics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GatewayStats"
+
+  /history:
+    get:
+      operationId: getChatHistory
+      tags: [history]
+      summary: Get chat history
+      description: Returns list of recent chat sessions
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+            minimum: 1
+            maximum: 200
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+            minimum: 0
+      responses:
+        "200":
+          description: Chat history list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatHistoryList"
+
+  /history/{conversationId}:
+    get:
+      operationId: getConversation
+      tags: [history]
+      summary: Get a specific conversation
+      parameters:
+        - name: conversationId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Conversation detail
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatSession"
+        "404":
+          description: Conversation not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    delete:
+      operationId: deleteConversation
+      tags: [history]
+      summary: Delete a conversation
+      parameters:
+        - name: conversationId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessResponse"
+
+  /keys:
+    get:
+      operationId: listApiKeys
+      tags: [keys]
+      summary: List all API keys
+      responses:
+        "200":
+          description: List of API keys
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiKeyList"
+    post:
+      operationId: createApiKey
+      tags: [keys]
+      summary: Create a new API key
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateApiKeyRequest"
+      responses:
+        "201":
+          description: Created API key (full key only shown once)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiKeyCreated"
+
+  /keys/{id}:
+    delete:
+      operationId: deleteApiKey
+      tags: [keys]
+      summary: Delete an API key
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessResponse"
+    patch:
+      operationId: updateApiKey
+      tags: [keys]
+      summary: Update API key status
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateApiKeyRequest"
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiKey"
+
+  /models:
+    get:
+      operationId: listModels
+      tags: [chat]
+      summary: List available Qwen models
+      responses:
+        "200":
+          description: Available models
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelList"
+
+  /token-pool:
+    get:
+      operationId: getTokenPoolStatus
+      tags: [stats]
+      summary: Get token pool status
+      description: Returns current bx-umidtoken pool health and rotation status
+      responses:
+        "200":
+          description: Token pool status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenPoolStatus"
+
 components:
   schemas:
     HealthStatus:
@@ -34,3 +264,286 @@ components:
       required:
         - status
 
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+        code:
+          type: string
+      required:
+        - error
+
+    SuccessResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        message:
+          type: string
+      required:
+        - success
+
+    ChatRequest:
+      type: object
+      properties:
+        prompt:
+          type: string
+        model:
+          type: string
+          default: qwen-plus
+        conversationId:
+          type: string
+          nullable: true
+        apiKey:
+          type: string
+          nullable: true
+      required:
+        - prompt
+
+    ChatResponse:
+      type: object
+      properties:
+        response:
+          type: string
+        thinking:
+          type: string
+          nullable: true
+        model:
+          type: string
+        conversationId:
+          type: string
+        tokenUsage:
+          type: integer
+          nullable: true
+      required:
+        - response
+        - model
+        - conversationId
+
+    ChatMessage:
+      type: object
+      properties:
+        role:
+          type: string
+          enum: [user, assistant]
+        content:
+          type: string
+        thinking:
+          type: string
+          nullable: true
+        timestamp:
+          type: string
+      required:
+        - role
+        - content
+        - timestamp
+
+    ChatSession:
+      type: object
+      properties:
+        conversationId:
+          type: string
+        model:
+          type: string
+        messages:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChatMessage"
+        createdAt:
+          type: string
+        updatedAt:
+          type: string
+        messageCount:
+          type: integer
+      required:
+        - conversationId
+        - model
+        - messages
+        - createdAt
+        - updatedAt
+        - messageCount
+
+    ChatHistoryList:
+      type: object
+      properties:
+        sessions:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChatSession"
+        total:
+          type: integer
+        offset:
+          type: integer
+        limit:
+          type: integer
+      required:
+        - sessions
+        - total
+        - offset
+        - limit
+
+    GatewayStats:
+      type: object
+      properties:
+        totalRequests:
+          type: integer
+        successRequests:
+          type: integer
+        failedRequests:
+          type: integer
+        successRate:
+          type: number
+        requestsToday:
+          type: integer
+        requestsThisHour:
+          type: integer
+        averageResponseTime:
+          type: number
+        activeApiKeys:
+          type: integer
+        tokenPoolSize:
+          type: integer
+        tokenPoolHealthy:
+          type: integer
+      required:
+        - totalRequests
+        - successRequests
+        - failedRequests
+        - successRate
+        - requestsToday
+        - requestsThisHour
+        - averageResponseTime
+        - activeApiKeys
+        - tokenPoolSize
+        - tokenPoolHealthy
+
+    ApiKey:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        keyPreview:
+          type: string
+          description: Masked key (e.g. gw_****abcd)
+        createdAt:
+          type: string
+        lastUsed:
+          type: string
+          nullable: true
+        requestCount:
+          type: integer
+        isActive:
+          type: boolean
+      required:
+        - id
+        - name
+        - keyPreview
+        - createdAt
+        - requestCount
+        - isActive
+
+    ApiKeyCreated:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        key:
+          type: string
+          description: Full API key — only shown once
+        keyPreview:
+          type: string
+        createdAt:
+          type: string
+        isActive:
+          type: boolean
+      required:
+        - id
+        - name
+        - key
+        - keyPreview
+        - createdAt
+        - isActive
+
+    ApiKeyList:
+      type: object
+      properties:
+        keys:
+          type: array
+          items:
+            $ref: "#/components/schemas/ApiKey"
+        total:
+          type: integer
+      required:
+        - keys
+        - total
+
+    CreateApiKeyRequest:
+      type: object
+      properties:
+        name:
+          type: string
+      required:
+        - name
+
+    UpdateApiKeyRequest:
+      type: object
+      properties:
+        isActive:
+          type: boolean
+        name:
+          type: string
+
+    QwenModel:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        maxTokens:
+          type: integer
+      required:
+        - id
+        - name
+        - description
+        - maxTokens
+
+    ModelList:
+      type: object
+      properties:
+        models:
+          type: array
+          items:
+            $ref: "#/components/schemas/QwenModel"
+      required:
+        - models
+
+    TokenPoolStatus:
+      type: object
+      properties:
+        total:
+          type: integer
+        healthy:
+          type: integer
+        exhausted:
+          type: integer
+        lastRefreshed:
+          type: string
+          nullable: true
+        nextRefresh:
+          type: string
+          nullable: true
+        rotationCount:
+          type: integer
+      required:
+        - total
+        - healthy
+        - exhausted
+        - rotationCount
