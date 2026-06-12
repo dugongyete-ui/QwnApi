@@ -176,6 +176,17 @@ const QWEN_API_MODEL_MAP: Record<string, string> = {
   "qwen-plus":        "qwen-plus-2025-07-28",
   "qwen-max":         "qwen3.7-max",
   "qwen-turbo":       "qwen3.5-flash",
+  // Vision model aliases — all map to working chat.qwen.ai models
+  "qwen-vl-max":             "qwen3.7-max",
+  "qwen-vl-max-latest":      "qwen3.7-max",
+  "qwen-vl":                 "qwen3.7-max",
+  "qwen-vl-plus":            "qwen3.6-plus",
+  "qwen2-vl-7b-instruct":    "qwen3-30b-a3b",
+  "qwen2-vl-72b-instruct":   "qwen3-235b-a22b",
+  "qwen2.5-vl":              "qwen3-235b-a22b",
+  "qwen2.5-vl-7b-instruct":  "qwen3-30b-a3b",
+  "qwen2.5-vl-72b-instruct": "qwen3-235b-a22b",
+  "qwen2.5-vl-max":          "qwen3.7-max",
 };
 
 function resolveModel(raw: string): string {
@@ -948,23 +959,13 @@ router.post("/chat/completions", async (req, res) => {
     const allImageUrls = augmentedMessages.flatMap(m => getMessageImages(m.content));
     const isVision = allImageUrls.length > 0;
 
-    // Upload images via Python sidecar (requires QWEN_SESSION_TOKEN)
+    // Upload images via OSS — uses bx-umidtoken + auto-fetched acw_tc cookie (no session token needed)
     let resolvedFiles: QwenFileDescriptor[] = [];
     if (isVision) {
-      if (!sessionToken) {
-        res.status(400).json({
-          error: {
-            message:
-              "Image analysis requires QWEN_SESSION_TOKEN. " +
-              "Set it to your Qwen Bearer token " +
-              "(open chat.qwen.ai → DevTools → Network → copy the Authorization header value).",
-            type: "invalid_request_error",
-            code: "vision_requires_auth",
-          },
-        });
-        return;
-      }
-      resolvedFiles = await resolveImageUrls(allImageUrls, sessionToken);
+      const headers = qwenHeaders(midtoken);
+      const cookie = await getQwenCookies(midtoken);
+      const uploadHeaders = { ...headers, Cookie: cookie };
+      resolvedFiles = await resolveImageUrls(allImageUrls, uploadHeaders);
       logger.info({ count: resolvedFiles.length, total: allImageUrls.length }, "vision: images uploaded");
     }
 
