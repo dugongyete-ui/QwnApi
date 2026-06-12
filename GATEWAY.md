@@ -15,15 +15,15 @@ https://<repl>.replit.app   ← production (deployed)
 
 ## Autentikasi
 
-Semua endpoint `/v1/*` membutuhkan API key di header Authorization:
+Semua endpoint `/v1/*` membutuhkan API key di header `Authorization`:
 
 ```
-Authorization: Bearer sk-dzeck-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+Authorization: Bearer gw_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
-Format API key: `sk-dzeck-` diikuti 32 karakter hex.
+**Format API key:** Key baru yang dibuat via `/api/keys` memiliki prefix `gw_` diikuti 32 karakter hex. Key yang diinsert manual ke DB bisa memiliki format custom.
 
-**Endpoint admin** (`/api/*`) tidak membutuhkan autentikasi (hanya untuk internal/localhost).
+**Endpoint admin** (`/api/*`) tidak membutuhkan autentikasi.
 
 ---
 
@@ -35,7 +35,7 @@ Format API key: `sk-dzeck-` diikuti 32 karakter hex.
 | `qwen3-30b-a3b` | Cepat, seimbang | 131k |
 | `qwen3.7-max` | Vision + multimodal | 131k |
 | `qwen3.7-plus` | Plus tier | 131k |
-| `qwen3.6-plus` | Plus tier generasi sebelumnya | 131k |
+| `qwen3.6-plus` | Plus tier generasi lama | 131k |
 | `qwen3.5-flash` | Paling cepat | 131k |
 | `qwen3.5-35b-a3b` | MoE efisien | 131k |
 | `qwen-plus` | Alias → qwen3-235b-a22b | 131k |
@@ -46,37 +46,63 @@ Format API key: `sk-dzeck-` diikuti 32 karakter hex.
 | `qwen-audio-turbo` | Alias audio → qwen2.5-omni-7b | 32k |
 | `qwen2-audio-instruct` | Alias audio → qwen2.5-omni-7b | 32k |
 
-**Alias vision lain yang tersedia:** `qwen-vl`, `qwen-vl-plus`, `qwen2-vl-7b-instruct`, `qwen2-vl-72b-instruct`, `qwen2.5-vl`, `qwen2.5-vl-max`
+**Alias vision lain:** `qwen-vl`, `qwen-vl-plus`, `qwen2-vl-7b-instruct`, `qwen2-vl-72b-instruct`, `qwen2.5-vl`, `qwen2.5-vl-max`
+**Alias audio lain:** `qwen2.5-omni`, `qwen2.5-omni-turbo`
 
 ---
 
-## Endpoints
+## Endpoints OpenAI-Compatible (`/v1/*`)
 
 ### `GET /v1/models` — Daftar model
 
 ```bash
 curl http://localhost:8080/v1/models \
-  -H "Authorization: Bearer sk-dzeck-..."
+  -H "Authorization: Bearer gw_..."
 ```
 
-Response (OpenAI format):
+Response:
 ```json
 {
   "object": "list",
   "data": [
-    { "id": "qwen3-235b-a22b", "object": "model", "owned_by": "qwen-gateway" },
-    ...
+    {
+      "id": "qwen3-235b-a22b",
+      "object": "model",
+      "created": 1781252642,
+      "owned_by": "qwen-gateway",
+      "context_window": 131072
+    }
   ]
 }
 ```
 
 ---
 
-### `POST /v1/chat/completions` — Chat (non-streaming)
+### `GET /v1/models/:model` — Detail satu model
+
+```bash
+curl http://localhost:8080/v1/models/qwen3-30b-a3b \
+  -H "Authorization: Bearer gw_..."
+```
+
+Response:
+```json
+{
+  "id": "qwen3-30b-a3b",
+  "object": "model",
+  "created": 1781252642,
+  "owned_by": "qwen-gateway",
+  "context_window": 131072
+}
+```
+
+---
+
+### `POST /v1/chat/completions` — Chat teks (non-streaming)
 
 ```bash
 curl http://localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer sk-dzeck-..." \
+  -H "Authorization: Bearer gw_..." \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3-30b-a3b",
@@ -86,17 +112,29 @@ curl http://localhost:8080/v1/chat/completions \
   }'
 ```
 
-Response (OpenAI format):
+Response:
 ```json
 {
   "id": "chatcmpl-...",
   "object": "chat.completion",
+  "created": 1781252192,
   "model": "qwen3-30b-a3b",
+  "system_fingerprint": "fp_qwen_gateway_v2",
+  "service_tier": "default",
   "choices": [{
-    "message": { "role": "assistant", "content": "7 × 8 = 56" },
-    "finish_reason": "stop"
+    "index": 0,
+    "message": { "role": "assistant", "content": "56", "refusal": null, "tool_calls": null },
+    "finish_reason": "stop",
+    "logprobs": null
   }],
-  "usage": { "prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20 }
+  "usage": {
+    "prompt_tokens": 65,
+    "completion_tokens": 3,
+    "total_tokens": 68,
+    "prompt_tokens_details": { "cached_tokens": 0, "audio_tokens": 0 },
+    "completion_tokens_details": { "reasoning_tokens": 0 }
+  },
+  "x_gateway": { "conversation_id": "uuid-..." }
 }
 ```
 
@@ -106,26 +144,33 @@ Response (OpenAI format):
 
 ```bash
 curl http://localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer sk-dzeck-..." \
+  -H "Authorization: Bearer gw_..." \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen3-30b-a3b",
+    "model": "qwen3.5-flash",
     "stream": true,
-    "messages": [{ "role": "user", "content": "Hitung 100 dalam 3 langkah" }]
+    "messages": [{ "role": "user", "content": "Sebutkan 3 warna" }]
   }'
 ```
 
-Response: SSE stream dengan `data: {...}` chunks, diakhiri `data: [DONE]`.
+Response: SSE stream dengan format:
+```
+data: {"id":"chatcmpl-...","choices":[{"delta":{"role":"assistant","content":""},...}]}
+
+data: {"id":"chatcmpl-...","choices":[{"delta":{"content":"Merah"},...}]}
+
+data: [DONE]
+```
 
 ---
 
 ### `POST /v1/chat/completions` — Vision (analisis gambar)
 
-Gunakan model vision (`qwen-vl-max`, `qwen3.7-max`, dll.). Gambar bisa dari URL atau data URI base64.
+Gunakan model vision (`qwen-vl-max`, `qwen3.7-max`, dll.). URL gambar harus bisa diunduh server (hindari URL Wikipedia/hotlink-protected). Data URI selalu bekerja.
 
 ```bash
 curl http://localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer sk-dzeck-..." \
+  -H "Authorization: Bearer gw_..." \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen-vl-max",
@@ -142,13 +187,16 @@ curl http://localhost:8080/v1/chat/completions \
   }'
 ```
 
-**Catatan:** URL gambar harus bisa diunduh oleh server gateway (hindari URL Wikipedia atau situs dengan hotlink protection). Data URI `data:image/jpeg;base64,...` selalu bekerja.
+Bisa juga pakai data URI:
+```json
+"image_url": { "url": "data:image/jpeg;base64,/9j/4AAQ..." }
+```
 
 ---
 
 ### `POST /v1/chat/completions` — Dokumen / file teks
 
-Kirim file teks (markdown, txt, csv, json, html, xml) sebagai base64. Gateway otomatis meng-inline konten ke prompt.
+File teks (markdown, txt, csv, json, html, xml) dikirim sebagai base64. Gateway otomatis men-decode dan meng-inline konten ke dalam prompt — model langsung bisa membacanya.
 
 ```python
 import base64, requests
@@ -157,7 +205,7 @@ content = open("laporan.md", "rb").read()
 b64 = base64.b64encode(content).decode()
 
 response = requests.post("http://localhost:8080/v1/chat/completions",
-  headers={"Authorization": "Bearer sk-dzeck-..."},
+  headers={"Authorization": "Bearer gw_..."},
   json={
     "model": "qwen3-30b-a3b",
     "messages": [{
@@ -171,7 +219,7 @@ response = requests.post("http://localhost:8080/v1/chat/completions",
             "name": "laporan.md"
           }
         },
-        { "type": "text", "text": "Rangkum dokumen ini dalam 3 poin." }
+        { "type": "text", "text": "Rangkum dokumen ini." }
       ]
     }]
   }
@@ -179,15 +227,15 @@ response = requests.post("http://localhost:8080/v1/chat/completions",
 print(response.json()["choices"][0]["message"]["content"])
 ```
 
-**MIME types teks yang didukung (inline):** `text/plain`, `text/markdown`, `text/csv`, `text/html`, `text/xml`, `application/json`, `application/xml`
+**MIME types teks yang diinline langsung:** `text/plain`, `text/markdown`, `text/csv`, `text/html`, `text/xml`, `application/json`, `application/xml`
 
-**File binary (PDF, DOCX):** Dikirim via Qwen OSS — hasilnya tergantung Qwen server-side parse.
+**File binary (PDF, DOCX):** Dikirim via Qwen OSS — bergantung pada Qwen server-side parse.
 
 ---
 
 ### `POST /v1/chat/completions` — Audio
 
-Gunakan model omni/audio: `qwen-audio-turbo` atau `qwen2.5-omni-7b`.
+Harus menggunakan model omni/audio: `qwen-audio-turbo` atau `qwen2.5-omni-7b`. Model text-only tidak bisa proses audio.
 
 ```python
 import base64, requests
@@ -196,7 +244,7 @@ audio_bytes = open("recording.wav", "rb").read()
 b64 = base64.b64encode(audio_bytes).decode()
 
 response = requests.post("http://localhost:8080/v1/chat/completions",
-  headers={"Authorization": "Bearer sk-dzeck-..."},
+  headers={"Authorization": "Bearer gw_..."},
   json={
     "model": "qwen-audio-turbo",
     "messages": [{
@@ -206,10 +254,10 @@ response = requests.post("http://localhost:8080/v1/chat/completions",
           "type": "input_audio",
           "input_audio": {
             "data": b64,
-            "format": "wav"      # wav, mp3, ogg, flac, m4a
+            "format": "wav"
           }
         },
-        { "type": "text", "text": "Transkripsi audio ini." }
+        { "type": "text", "text": "Transkripsi dan deskripsikan audio ini." }
       ]
     }]
   }
@@ -217,8 +265,11 @@ response = requests.post("http://localhost:8080/v1/chat/completions",
 print(response.json()["choices"][0]["message"]["content"])
 ```
 
-**Format audio yang didukung:** WAV, MP3, OGG, FLAC, M4A, AAC, WebM.
-**Model yang TIDAK support audio:** `qwen3-30b-a3b`, `qwen3-235b-a22b`, semua model non-omni.
+**Format audio:** `wav`, `mp3`, `ogg`, `flac`, `m4a`, `aac`, `webm`
+
+**Model yang support audio:** `qwen2.5-omni-7b`, `qwen-audio-turbo`, `qwen2-audio-instruct`, `qwen2.5-omni`, `qwen2.5-omni-turbo`
+
+**Model yang TIDAK support audio:** semua model selain omni (qwen3-xxx, qwen3.x-xxx, qwen-plus, qwen-max, dll.)
 
 ---
 
@@ -226,11 +277,11 @@ print(response.json()["choices"][0]["message"]["content"])
 
 ```bash
 curl http://localhost:8080/v1/images/generations \
-  -H "Authorization: Bearer sk-dzeck-..." \
+  -H "Authorization: Bearer gw_..." \
   -H "Content-Type: application/json" \
   -d '{
     "model": "dall-e-3",
-    "prompt": "Kucing astronot di luar angkasa, digital art, detailed",
+    "prompt": "Seekor kucing oranye di taman bunga, digital art",
     "n": 1,
     "size": "1024x1024"
   }'
@@ -239,92 +290,197 @@ curl http://localhost:8080/v1/images/generations \
 Response:
 ```json
 {
-  "data": [{ "url": "https://img.alicdn.com/..." }]
+  "created": 1781252000,
+  "data": [
+    { "url": "https://cdn.qwenlm.ai/output/..." }
+  ]
 }
 ```
 
-**Catatan:** Parameter `model` diabaikan — selalu gunakan Qwen image generation internal (`qwen3.7-plus` dengan `chat_type: "t2i"`). URL gambar dari Alibaba CDN.
+**Catatan:** Parameter `model` diabaikan — selalu gunakan Qwen image generation internal. URL gambar dari Alibaba CDN (`cdn.qwenlm.ai`).
 
 ---
 
-### `POST /v1/completions` — Legacy completions
+### `POST /v1/completions` — Legacy completions (text completion)
 
 ```bash
 curl http://localhost:8080/v1/completions \
-  -H "Authorization: Bearer sk-dzeck-..." \
+  -H "Authorization: Bearer gw_..." \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen3-30b-a3b",
+    "model": "qwen3.5-flash",
     "prompt": "Ibu kota Indonesia adalah",
     "max_tokens": 50
   }'
 ```
 
+Response (OpenAI format `text.completion`):
+```json
+{
+  "id": "cmpl-...",
+  "object": "text_completion",
+  "choices": [{ "text": " Jakarta.", "finish_reason": "stop" }]
+}
+```
+
+---
+
+## Parameters Chat Completions
+
+| Parameter | Tipe | Keterangan |
+|-----------|------|------------|
+| `model` | string | ID model (lihat tabel model di atas) |
+| `messages` | array | Array pesan OpenAI format |
+| `stream` | boolean | SSE streaming (default: `false`) |
+| `temperature` | float | 0.0–2.0 |
+| `max_tokens` | int | Maks token output |
+| `top_p` | float | 0.0–1.0 |
+| `n` | int | Jumlah completion (non-streaming saja) |
+| `stop` | string / array | Stop sequences |
+| `response_format` | object | `{"type":"json_object"}` atau `{"type":"json_schema","json_schema":{...}}` |
+| `tools` | array | Function calling (OpenAI format) |
+| `tool_choice` | string / object | `"auto"`, `"required"`, `{"type":"function","function":{"name":"..."}}` |
+| `reasoning_effort` | string | `"none"`, `"low"`, `"medium"`, `"high"` |
+| `conversation_id` | string | UUID untuk session persistence lintas request |
+| `stream_options` | object | `{"include_usage": true}` untuk token count di SSE |
+
 ---
 
 ## Admin Endpoints (`/api/*`)
 
-Tidak membutuhkan autentikasi (internal only).
+Tidak membutuhkan autentikasi. Hanya untuk internal/localhost.
 
-### Kelola API Keys
+---
+
+### `GET /api/keys` — List semua API key
 
 ```bash
-# List semua keys
 curl http://localhost:8080/api/keys
-
-# Buat key baru
-curl -X POST http://localhost:8080/api/keys \
-  -H "Content-Type: application/json" \
-  -d '{ "name": "My App Key", "isAdmin": false }'
-
-# Hapus key
-curl -X DELETE http://localhost:8080/api/keys/{id}
 ```
 
-Response create key:
+Response:
 ```json
 {
-  "id": "uuid",
-  "name": "My App Key",
-  "key": "sk-dzeck-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-  "isAdmin": false,
-  "usageCount": 0,
-  "createdAt": "2026-01-01T00:00:00.000Z"
+  "keys": [
+    {
+      "id": "11111111-1111-1111-1111-111111111111",
+      "name": "my-app-key",
+      "keyPreview": "gw_ab****cd12",
+      "createdAt": "2026-06-12T08:00:00.000Z",
+      "lastUsed": null,
+      "requestCount": 0,
+      "isActive": true
+    }
+  ],
+  "total": 1
 }
 ```
 
-### Statistik
+**Catatan:** Field `key` (nilai penuh) tidak dikembalikan di list — hanya tersedia saat key pertama kali dibuat.
+
+---
+
+### `POST /api/keys` — Buat API key baru
 
 ```bash
-# Request stats (7 hari terakhir)
-curl http://localhost:8080/api/stats
+curl -X POST http://localhost:8080/api/keys \
+  -H "Content-Type: application/json" \
+  -d '{ "name": "My App Key" }'
+```
 
-# Status token pool
-curl http://localhost:8080/api/token-pool
+Response (key penuh hanya ditampilkan sekali, simpan baik-baik):
+```json
+{
+  "id": "fa2a5b43-73d9-4202-ae79-af5e6f9980ab",
+  "name": "My App Key",
+  "key": "gw_c19d9d13619c40faac301eec833a5e76",
+  "keyPreview": "gw_c1****5e76",
+  "createdAt": "2026-06-12T08:37:04.564Z",
+  "isActive": true
+}
+```
 
-# Force refresh pool tokens
-curl -X POST http://localhost:8080/api/token-pool/refresh
+**Format key:** `gw_` diikuti 32 karakter hex. Simpan nilai `key` penuh — tidak bisa diambil lagi setelah ini.
+
+---
+
+### `DELETE /api/keys/:id` — Hapus API key
+
+```bash
+curl -X DELETE http://localhost:8080/api/keys/fa2a5b43-73d9-4202-ae79-af5e6f9980ab
+```
+
+Response:
+```json
+{ "success": true, "message": "API key deleted" }
 ```
 
 ---
 
-## Parameters yang Didukung
+### `PATCH /api/keys/:id` — Update nama / status key
 
-| Parameter | Tipe | Keterangan |
-|-----------|------|------------|
-| `model` | string | ID model (lihat tabel model) |
-| `messages` | array | Array pesan OpenAI format |
-| `stream` | boolean | SSE streaming (`false` default) |
-| `temperature` | float | 0.0–2.0 |
-| `max_tokens` | int | Maks token output |
-| `top_p` | float | 0.0–1.0 |
-| `n` | int | Jumlah completion (non-streaming) |
-| `stop` | string/array | Stop sequences |
-| `response_format` | object | `{"type":"json_object"}` atau `{"type":"json_schema",...}` |
-| `tools` | array | Function calling (OpenAI format) |
-| `tool_choice` | string/object | `"auto"`, `"required"`, `{"type":"function",...}` |
-| `reasoning_effort` | string | `"none"`, `"low"`, `"medium"`, `"high"` |
-| `conversation_id` | string | UUID untuk session persistence |
+```bash
+curl -X PATCH http://localhost:8080/api/keys/fa2a5b43-... \
+  -H "Content-Type: application/json" \
+  -d '{ "name": "Nama Baru", "isActive": false }'
+```
+
+Response: objek key yang diupdate (format sama dengan GET list per-item).
+
+---
+
+### `GET /api/stats` — Statistik request gateway
+
+```bash
+curl http://localhost:8080/api/stats
+```
+
+Response:
+```json
+{
+  "totalRequests": 16,
+  "successRequests": 16,
+  "failedRequests": 0,
+  "successRate": 100,
+  "requestsToday": 16,
+  "requestsThisHour": 16,
+  "averageResponseTime": 7994,
+  "activeApiKeys": 1,
+  "tokenPoolSize": 505,
+  "tokenPoolHealthy": 505
+}
+```
+
+---
+
+### `GET /api/token-pool` — Status token pool
+
+```bash
+curl http://localhost:8080/api/token-pool
+```
+
+Response:
+```json
+{
+  "size": 505,
+  "entries": [
+    { "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)...", "ageMs": 2560617, "hasToken": true },
+    ...
+  ]
+}
+```
+
+Field `size` = jumlah token aktif. Field `entries` = array semua token (ua = user-agent, ageMs = umur token dalam ms, hasToken = token tersedia).
+
+---
+
+### `POST /api/token-pool/refresh` — Force refresh pool
+
+```bash
+curl -X POST http://localhost:8080/api/token-pool/refresh
+```
+
+Memaksa re-fetch semua token yang expired/pre-expired. Berguna saat pool kosong setelah restart panjang.
 
 ---
 
@@ -336,7 +492,7 @@ curl -X POST http://localhost:8080/api/token-pool/refresh
 from openai import OpenAI
 
 client = OpenAI(
-    api_key="sk-dzeck-...",
+    api_key="gw_...",
     base_url="http://localhost:8080/v1"
 )
 
@@ -349,8 +505,8 @@ print(response.choices[0].message.content)
 
 # Streaming
 with client.chat.completions.stream(
-    model="qwen3-30b-a3b",
-    messages=[{"role": "user", "content": "Hitung 1 sampai 10"}]
+    model="qwen3.5-flash",
+    messages=[{"role": "user", "content": "Hitung 1 sampai 5"}]
 ) as stream:
     for text in stream.text_stream:
         print(text, end="", flush=True)
@@ -362,30 +518,39 @@ with client.chat.completions.stream(
 import OpenAI from "openai";
 
 const client = new OpenAI({
-  apiKey: "sk-dzeck-...",
+  apiKey: "gw_...",
   baseURL: "http://localhost:8080/v1",
 });
 
+// Chat biasa
 const response = await client.chat.completions.create({
   model: "qwen3-30b-a3b",
   messages: [{ role: "user", content: "Apa itu machine learning?" }],
 });
 console.log(response.choices[0].message.content);
+
+// JSON mode
+const jsonResp = await client.chat.completions.create({
+  model: "qwen3-30b-a3b",
+  response_format: { type: "json_object" },
+  messages: [{ role: "user", content: "Beri data 3 kota Indonesia dalam JSON" }],
+});
+console.log(JSON.parse(jsonResp.choices[0].message.content!));
 ```
 
 ---
 
 ## Database Schema
 
-Gateway menggunakan PostgreSQL dengan Drizzle ORM. Schema di `lib/db/src/schema/`.
+PostgreSQL + Drizzle ORM. Schema di `lib/db/src/schema/`.
 
-| Tabel | Keterangan |
-|-------|-----------|
-| `api_keys` | API keys dengan hash SHA256, usage count |
-| `gateway_stats` | Log per-request (durasi, model, success: boolean) |
-| `chat_sessions` | Riwayat percakapan (conversation_id, messages JSON) |
+| Tabel | Kolom Utama | Keterangan |
+|-------|-------------|-----------|
+| `api_keys` | `id`, `name`, `key_hash`, `key_preview`, `is_active`, `request_count`, `last_used` | API keys dengan hash SHA256 |
+| `gateway_stats` | `id`, `created_at`, `duration_ms`, `model`, `success` (boolean) | Log per-request |
+| `chat_sessions` | `conversation_id`, `model`, `messages` (JSONB), `message_count` | Riwayat percakapan |
 
-**Auto-migrasi**: Tabel dan kolom dibuat otomatis saat server startup via `migrate.ts`.
+**Auto-migrasi:** Tabel dan kolom dibuat otomatis saat server startup via `artifacts/api-server/src/lib/migrate.ts`.
 
 ---
 
@@ -393,14 +558,19 @@ Gateway menggunakan PostgreSQL dengan Drizzle ORM. Schema di `lib/db/src/schema/
 
 Gateway membutuhkan `bx-umidtoken` (token anti-bot Alibaba) untuk setiap request ke Qwen.
 
-- **Pool size**: 509 token
-- **Cache**: Disimpan ke `artifacts/api-server/token_cache.json`
-- **Keepalive**: Refresh otomatis setiap 50 menit (pool tidak pernah expired)
-- **Rotation**: Saat upload gagal karena rate limit, gateway otomatis rotasi ke token lain
+| Property | Nilai |
+|----------|-------|
+| Pool size | 509 slot |
+| Cache disk | `artifacts/api-server/token_cache.json` |
+| Keepalive | Refresh otomatis setiap 50 menit |
+| Rotation | Saat upload gagal karena rate limit, rotasi ke token pool lain |
 
-Lihat status pool:
 ```bash
+# Cek status pool
 curl http://localhost:8080/api/token-pool
+
+# Force refresh
+curl -X POST http://localhost:8080/api/token-pool/refresh
 ```
 
 ---
@@ -409,9 +579,29 @@ curl http://localhost:8080/api/token-pool
 
 | Variabel | Wajib | Keterangan |
 |----------|-------|-----------|
-| `PORT` | Ya | Port server (8080 di Replit) |
+| `PORT` | Ya | Port server (8080 di Replit dev) |
 | `DATABASE_URL` | Ya | PostgreSQL connection string |
-| `QWEN_SESSION_TOKEN` | Tidak | Token sesi Qwen login (opsional, untuk akun premium) |
+| `QWEN_SESSION_TOKEN` | Tidak | Token sesi Qwen akun premium (opsional) |
+
+---
+
+## Hasil Test Semua Fitur (Verified)
+
+| Fitur | Status | Catatan |
+|-------|--------|---------|
+| `GET /v1/models` | ✅ | 13 model listed |
+| Chat teks | ✅ | 12×12=144, token count akurat |
+| Streaming SSE | ✅ | Word-by-word real-time |
+| Vision | ✅ | Fjord Norwegia — deskripsi akurat |
+| Dokumen `.md` | ✅ | Apel Rp5.000, Jeruk Rp3.000 — terbaca dari base64 inline |
+| Audio WAV | ✅ | 440Hz → "nada sambung telepon" (model: qwen-audio-turbo) |
+| Image generation | ✅ | URL `cdn.qwenlm.ai/output/...` |
+| `GET /api/keys` | ✅ | `{keys:[...], total:N}` |
+| `POST /api/keys` | ✅ | `{id, name, key, keyPreview, createdAt, isActive}` |
+| `DELETE /api/keys` | ✅ | `{success:true}` |
+| `GET /api/stats` | ✅ | 100% success rate |
+| `GET /api/token-pool` | ✅ | 505 token aktif |
+| `POST /api/token-pool/refresh` | ✅ | Force refresh |
 
 ---
 
@@ -419,9 +609,10 @@ curl http://localhost:8080/api/token-pool
 
 | Masalah | Penyebab | Solusi |
 |---------|---------|--------|
-| Vision: model bilang tidak ada gambar | URL gambar di-block saat download | Gunakan URL yang allow automated access, atau data URI |
-| Dokumen: model tidak bisa baca file | File bukan teks atau parse Qwen belum selesai | Gunakan MIME type teks; file binary perlu waktu parse |
-| Audio: model bilang tidak support audio | Model text-only dipakai | Ganti ke `qwen-audio-turbo` atau `qwen2.5-omni-7b` |
-| 503 WAF blocked | curl_cffi pakai `impersonate=` | Hapus flag impersonate dari `qwen_cffi.py` |
-| Pool tokens 0 | Server baru restart, pool belum siap | Tunggu ~10 detik, atau hit `/api/token-pool/refresh` |
-| DB error: invalid input for boolean | Kolom `success` tipe salah | Jalankan migration manual: `ALTER TABLE gateway_stats ALTER COLUMN success TYPE boolean USING (success::boolean)` |
+| Vision: model bilang tidak ada gambar | URL gambar di-block saat download | Gunakan URL yang allow automated access, atau data URI `data:image/...;base64,...` |
+| Dokumen: model tidak bisa baca file | MIME type bukan teks | Pastikan `mime_type` adalah `text/markdown`, `text/plain`, dll. Binary harus via OSS |
+| Audio: "tidak bisa mendengar audio" | Model text-only dipakai | Ganti ke `qwen-audio-turbo` atau `qwen2.5-omni-7b` |
+| 401 Unauthorized | API key salah/tidak ada | Pastikan format `Bearer gw_...` di header Authorization |
+| 503 WAF blocked | curl_cffi pakai `impersonate=` | Hapus semua flag `impersonate` dari `qwen_cffi.py` |
+| Pool 0 token | Server baru restart | Tunggu ~10 detik atau hit `POST /api/token-pool/refresh` |
+| DB error: invalid input for boolean | Kolom `success` tipe lama (`text`) | Jalankan: `ALTER TABLE gateway_stats ALTER COLUMN success TYPE boolean USING (success::boolean)` |
