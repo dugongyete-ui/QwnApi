@@ -2,6 +2,8 @@ import express, { type Express } from "express";
 import cors from "cors";
 import pinoHttp from "pino-http";
 import rateLimit from "express-rate-limit";
+import path from "path";
+import { fileURLToPath } from "url";
 import router from "./routes";
 import v1Router from "./routes/v1";
 import { logger } from "./lib/logger";
@@ -66,6 +68,14 @@ app.use(express.urlencoded({ extended: true }));
 
 app.use("/api", router);
 app.use("/v1", v1RateLimit, v1Router);
+
+// Serve dashboard static files in production
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const dashboardDist = path.resolve(__dirname, "../../gateway-dashboard/dist/public");
+app.use(express.static(dashboardDist));
+app.get("*", (_req, res) => {
+  res.sendFile(path.join(dashboardDist, "index.html"));
+});
 
 // Warm the bx-umidtoken pool at startup (non-blocking)
 warmPool();
