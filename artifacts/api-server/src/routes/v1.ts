@@ -1225,7 +1225,7 @@ function resolveThinking(effort: ChatCompletionRequest["reasoning_effort"]): {
     case "medium": return { thinking_enabled: true,  thinking_budget: 20000 };
     case "low":    return { thinking_enabled: true,  thinking_budget: 4096  };
     case "none":   return { thinking_enabled: false, thinking_budget: 0     };
-    default:       return { thinking_enabled: false, thinking_budget: 81920 };
+    default:       return { thinking_enabled: false, thinking_budget: 0     };
   }
 }
 
