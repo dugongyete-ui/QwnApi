@@ -11,8 +11,9 @@
 import { Router } from "express";
 import { randomUUID } from "crypto";
 import { createHash, createHmac } from "crypto";
-import { execSync, spawn } from "child_process";
+import { spawn } from "child_process";
 import { join } from "path";
+import { withSlot } from "../lib/concurrency";
 import { db } from "@workspace/db";
 import { chatSessionsTable, apiKeysTable, gatewayStatsTable, requestLogsTable } from "@workspace/db";
 import { eq, sql } from "drizzle-orm";
@@ -63,20 +64,32 @@ function checkQwenWaf(text: string): void {
 }
 
 /**
- * Create a new Qwen chat session via Python subprocess.
+ * Create a new Qwen chat session via Python subprocess (async — does NOT block the event loop).
  * Returns the chat ID.
  */
-function qwenPyCreate(token: string, model: string, midtoken?: string): string {
+function qwenPyCreate(token: string, model: string, midtoken?: string): Promise<string> {
   const mid = midtoken ?? "";
-  const out = execSync(
-    `python3 "${QWEN_CFFI_PY}" create "${token}" "${model}" "${mid}"`,
-    { timeout: 15000, encoding: "utf8" },
-  );
-  checkQwenWaf(out);
-  const data = JSON.parse(out) as { success?: boolean; data?: { id?: string } };
-  const chatId = data?.data?.id;
-  if (!chatId) throw new Error(`qwen: createChat failed: ${out.slice(0, 200)}`);
-  return chatId;
+  const args = [QWEN_CFFI_PY, "create", token, model, mid];
+  return new Promise<string>((resolve, reject) => {
+    const py = spawn("python3", args);
+    const chunks: Buffer[] = [];
+    py.stdout.on("data", (d: Buffer) => chunks.push(d));
+    py.stderr.on("data", (d: Buffer) => logger.warn({ err: d.toString().trim() }, "qwen-cffi create: stderr"));
+    const timer = setTimeout(() => { py.kill(); reject(new Error("qwen-cffi create: timeout")); }, 15000);
+    py.on("close", (code) => {
+      clearTimeout(timer);
+      if (code !== 0) { reject(new Error(`qwen-cffi create: exit ${code}`)); return; }
+      const out = Buffer.concat(chunks).toString("utf8");
+      try {
+        checkQwenWaf(out);
+        const data = JSON.parse(out) as { success?: boolean; data?: { id?: string } };
+        const chatId = data?.data?.id;
+        if (!chatId) reject(new Error(`qwen: createChat failed: ${out.slice(0, 200)}`));
+        else resolve(chatId);
+      } catch (e) { reject(e); }
+    });
+    py.on("error", reject);
+  });
 }
 
 /**
@@ -873,9 +886,11 @@ router.post("/chat/completions", async (req, res) => {
 
     // 6. Create chat if no existing session
     if (!chatId) {
-      chatId = sessionToken
-        ? qwenPyCreate(sessionToken, model)
-        : qwenPyCreate("", model, midtoken);
+      chatId = await withSlot(() =>
+        sessionToken
+          ? qwenPyCreate(sessionToken, model)
+          : qwenPyCreate("", model, midtoken)
+      );
     }
 
     // 7. Build Qwen payload
@@ -922,9 +937,11 @@ router.post("/chat/completions", async (req, res) => {
     };
 
     // 8. Execute request (n parallel for non-streaming)
-    const getBody = () => sessionToken
-      ? qwenPyBody(sessionToken, chatId!, qwenPayload)
-      : qwenPyBody("", chatId!, qwenPayload, midtoken);
+    const getBody = () => withSlot(() =>
+      sessionToken
+        ? qwenPyBody(sessionToken, chatId!, qwenPayload)
+        : qwenPyBody("", chatId!, qwenPayload, midtoken)
+    );
 
     // ── STREAMING path ──────────────────────────────────────────────────────
     if (isStream) {
@@ -1057,13 +1074,16 @@ router.post("/chat/completions", async (req, res) => {
   } catch (err) {
     logger.error({ err }, "v1/chat/completions error");
     const errMsg = err instanceof Error ? err.message : "Internal server error";
-    const isWaf = errMsg.includes("WAF") || errMsg.includes("QWEN_SESSION_TOKEN");
-    const message = isWaf ? errMsg : "Internal gateway error";
-    const type    = isWaf ? "service_unavailable" : "server_error";
-    const code    = isWaf ? "qwen_waf_blocked" : "internal_error";
+    const errCode = (err as { code?: string }).code;
+    const isWaf      = errMsg.includes("WAF") || errMsg.includes("QWEN_SESSION_TOKEN");
+    const isOverload = errCode === "OVERLOADED" || errCode === "QUEUE_TIMEOUT";
+    const message = isWaf ? errMsg : isOverload ? errMsg : "Internal gateway error";
+    const type    = isWaf ? "service_unavailable" : isOverload ? "service_unavailable" : "server_error";
+    const code    = isWaf ? "qwen_waf_blocked" : isOverload ? errCode : "internal_error";
+    const status  = isWaf || isOverload ? 503 : 500;
     await recordRequest(false, Date.now() - startTime, _rawModel ?? "unknown");
     if (!res.headersSent) {
-      res.status(isWaf ? 503 : 500).json({ error: { message, type, code } });
+      res.status(status).json({ error: { message, type, code } });
     } else {
       res.write(`data: ${JSON.stringify({ error: message })}\n\ndata: [DONE]\n\n`);
       res.end();
@@ -1120,9 +1140,11 @@ router.post("/completions", async (req, res) => {
     const sessionToken = getQwenSessionToken();
     const midtoken = sessionToken ? "" : await getPooledMidtoken();
 
-    const chatId = sessionToken
-      ? qwenPyCreate(sessionToken, model)
-      : qwenPyCreate("", model, midtoken);
+    const chatId = await withSlot(() =>
+      sessionToken
+        ? qwenPyCreate(sessionToken, model)
+        : qwenPyCreate("", model, midtoken)
+    );
 
     const qwenPayload = {
       stream: true, incremental_output: true, chat_id: chatId, chat_mode: "normal",
@@ -1134,9 +1156,11 @@ router.post("/completions", async (req, res) => {
       }],
     };
 
-    const rawBody = sessionToken
-      ? await qwenPyBody(sessionToken, chatId, qwenPayload)
-      : await qwenPyBody("", chatId, qwenPayload, midtoken);
+    const rawBody = await withSlot(() =>
+      sessionToken
+        ? qwenPyBody(sessionToken, chatId, qwenPayload)
+        : qwenPyBody("", chatId, qwenPayload, midtoken)
+    );
 
     checkQwenWaf(rawBody);
     const { content: rawContent, inputTokens, outputTokens, upstreamError } = parseQwenSSE(rawBody);
@@ -1166,7 +1190,9 @@ router.post("/completions", async (req, res) => {
     logger.error({ err }, "v1/completions error");
     await recordRequest(false, Date.now() - startTime, _rawModel ?? "unknown");
     const errMsg = err instanceof Error ? err.message : "Internal server error";
-    res.status(500).json({ error: { message: errMsg, type: "server_error", code: "internal_error" } });
+    const errCode = (err as { code?: string }).code;
+    const isOverload = errCode === "OVERLOADED" || errCode === "QUEUE_TIMEOUT";
+    res.status(isOverload ? 503 : 500).json({ error: { message: errMsg, type: isOverload ? "service_unavailable" : "server_error", code: errCode ?? "internal_error" } });
   }
 });
 
