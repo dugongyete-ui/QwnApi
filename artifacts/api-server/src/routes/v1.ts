@@ -17,7 +17,7 @@ import { withSlot } from "../lib/concurrency";
 import { db } from "@workspace/db";
 import { chatSessionsTable, apiKeysTable, gatewayStatsTable, requestLogsTable } from "@workspace/db";
 import { eq, sql } from "drizzle-orm";
-import { getPooledMidtoken } from "../lib/umid-pool";
+import { getPooledMidtoken, getAllPoolTokens } from "../lib/umid-pool";
 import { logger } from "../lib/logger";
 
 const router = Router();
@@ -224,7 +224,8 @@ const SYSTEM_FINGERPRINT = "fp_qwen_gateway_v2";
 
 type QwenContentPart =
   | { type: "text"; text: string }
-  | { type: "image_url"; image_url: { url: string } };
+  | { type: "image_url"; image_url: { url: string } }
+  | { type: "input_audio"; input_audio: { url?: string; data?: string; format?: string } };
 
 interface OpenAIMessage {
   role: "system" | "user" | "assistant" | "tool";
@@ -420,19 +421,22 @@ function normaliseMessages(messages: OpenAIMessage[]): NormalisedMessage[] {
       return { role, content: contentToText(m) };
     }
 
-    // User message: check if it has images
-    if (Array.isArray(m.content) && m.content.some((p) => p.type === "image_url")) {
+    // User message: check if it has images or audio
+    if (Array.isArray(m.content) && m.content.some((p) => p.type === "image_url" || p.type === "input_audio")) {
       const parts: QwenContentPart[] = [];
       for (const p of m.content) {
         if (p.type === "image_url" && p.image_url?.url) {
           parts.push({ type: "image_url", image_url: { url: p.image_url.url } });
+        } else if (p.type === "input_audio") {
+          const audio = (p as { type: "input_audio"; input_audio?: { url?: string; data?: string; format?: string } }).input_audio;
+          if (audio) parts.push({ type: "input_audio", input_audio: audio });
         } else if (p.type === "text" && p.text) {
           parts.push({ type: "text", text: p.text });
         }
       }
       // Ensure at least one text part exists (Qwen requires a text part)
       if (!parts.some((p) => p.type === "text")) {
-        parts.push({ type: "text", text: "What is in this image?" });
+        parts.push({ type: "text", text: "Please analyze this file." });
       }
       return { role, content: parts };
     }
@@ -620,23 +624,225 @@ async function resolveImageUrls(
   return results.filter((r): r is QwenFileDescriptor => r !== null);
 }
 
-/** Build plain-text prompt from messages (strips image parts when files[] handles them). */
-function messagesToTextPrompt(messages: NormalisedMessage[], imagesHandledByFiles = false): string {
+// ─── Audio upload helpers ─────────────────────────────────────────────────────
+
+/** Detect MIME type for audio from format string or URL extension. */
+function detectAudioMimeType(format?: string, url?: string): string {
+  if (format) {
+    const f = format.toLowerCase();
+    if (f === "mp3" || f === "mpeg") return "audio/mpeg";
+    if (f === "mp4" || f === "m4a") return "audio/mp4";
+    if (f === "wav")  return "audio/wav";
+    if (f === "ogg")  return "audio/ogg";
+    if (f === "flac") return "audio/flac";
+    if (f === "webm") return "audio/webm";
+    if (f.startsWith("audio/")) return f;
+  }
+  if (url) {
+    const lower = url.toLowerCase().split("?")[0];
+    if (lower.endsWith(".mp3"))  return "audio/mpeg";
+    if (lower.endsWith(".mp4") || lower.endsWith(".m4a")) return "audio/mp4";
+    if (lower.endsWith(".wav"))  return "audio/wav";
+    if (lower.endsWith(".ogg"))  return "audio/ogg";
+    if (lower.endsWith(".flac")) return "audio/flac";
+    if (lower.endsWith(".webm")) return "audio/webm";
+  }
+  return "audio/mpeg";
+}
+
+/** Extract audio inputs from a message content. Returns list of {url?, data?, format?} */
+function getMessageAudios(content: string | QwenContentPart[] | null | undefined): { url?: string; data?: string; format?: string }[] {
+  if (!content || typeof content === "string") return [];
+  return (content as QwenContentPart[])
+    .filter((p): p is { type: "input_audio"; input_audio: { url?: string; data?: string; format?: string } } => p.type === "input_audio")
+    .map(p => p.input_audio);
+}
+
+/** Fetch audio bytes from a URL (with curl fallback for protected URLs). */
+async function fetchAudioBytes(url: string, mimeType: string): Promise<{ buf: Buffer; mimeType: string; filename: string }> {
+  try {
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/138.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Referer": "https://www.google.com/",
+      },
+      signal: AbortSignal.timeout(30000),
+    });
+    if (res.ok) {
+      const buf = Buffer.from(await res.arrayBuffer());
+      const ct = res.headers.get("content-type")?.split(";")[0].trim() || mimeType;
+      const ext = ct.split("/")[1]?.replace("mpeg", "mp3") || "mp3";
+      const rawName = url.split("/").pop()?.split("?")[0] || `audio.${ext}`;
+      const filename = rawName.includes(".") ? rawName : `${rawName}.${ext}`;
+      return { buf, mimeType: ct.startsWith("audio/") ? ct : mimeType, filename };
+    }
+  } catch { /* fall through to curl */ }
+
+  // Fallback: curl
+  const result = execSync(
+    `curl -sL --max-time 30 --max-filesize 52428800 \
+      -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/138.0.0.0 Safari/537.36" \
+      -H "Accept: */*" \
+      -w "\\n__CONTENT_TYPE__:%{content_type}__STATUS__:%{http_code}" \
+      "${url.replace(/"/g, '\\"')}"`,
+    { maxBuffer: 55 * 1024 * 1024, encoding: "buffer" },
+  ) as unknown as Buffer;
+  const raw = result.toString("latin1");
+  const metaMatch = raw.match(/\n__CONTENT_TYPE__:([^_]*)__STATUS__:(\d+)$/);
+  if (!metaMatch) throw new Error("curl: failed to parse audio metadata");
+  const status = Number(metaMatch[2]);
+  if (status < 200 || status >= 300) throw new Error(`curl: HTTP ${status} for audio ${url}`);
+  const metaSuffix = `\n__CONTENT_TYPE__:${metaMatch[1]}__STATUS__:${metaMatch[2]}`;
+  const bodyEnd = result.length - Buffer.byteLength(metaSuffix, "latin1");
+  const buf = result.slice(0, bodyEnd);
+  const ext = mimeType.split("/")[1]?.replace("mpeg", "mp3") || "mp3";
+  const rawName = url.split("/").pop()?.split("?")[0] || `audio.${ext}`;
+  const filename = rawName.includes(".") ? rawName : `${rawName}.${ext}`;
+  return { buf, mimeType, filename };
+}
+
+/**
+ * Upload a single audio file to Qwen OSS.
+ * Rotates through the token pool automatically if a token hits the daily upload rate limit.
+ */
+async function uploadAudioToQwen(
+  audio: { url?: string; data?: string; format?: string },
+  primaryMidtoken: string,
+): Promise<QwenFileDescriptor> {
+  const mimeType = detectAudioMimeType(audio.format, audio.url);
+  const ext = mimeType.split("/")[1]?.replace("mpeg", "mp3") || "mp3";
+
+  // Resolve bytes
+  let buf: Buffer;
+  let filename: string;
+  if (audio.data) {
+    buf = Buffer.from(audio.data, "base64");
+    filename = `audio.${ext}`;
+  } else if (audio.url) {
+    const fetched = await fetchAudioBytes(audio.url, mimeType);
+    buf = fetched.buf;
+    filename = fetched.filename;
+  } else {
+    throw new Error("audio: no url or data provided");
+  }
+
+  // Build candidate token list: primary first, then all others from pool for rotation
+  const allTokens = getAllPoolTokens();
+  const others = allTokens.filter(t => t.token !== primaryMidtoken);
+  const candidates = [
+    { token: primaryMidtoken, ua: allTokens.find(t => t.token === primaryMidtoken)?.ua ?? "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/138.0.0.0 Safari/537.36" },
+    ...others,
+  ];
+
+  let lastErr = "";
+  for (const candidate of candidates) {
+    try {
+      // Get acw_tc cookie for this token
+      const cookieRes = await fetch(QWEN_ORIGIN, {
+        headers: { "User-Agent": candidate.ua, "bx-umidtoken": candidate.token },
+        redirect: "follow",
+      });
+      const setCookie = cookieRes.headers.get("set-cookie") || "";
+      const cookie = setCookie.split(/,(?=[^ ])/).map((c: string) => c.split(";")[0].trim()).join("; ");
+
+      const uploadHeaders: Record<string, string> = {
+        "Content-Type": "application/json",
+        "User-Agent": candidate.ua,
+        "Origin": QWEN_ORIGIN,
+        "Referer": `${QWEN_ORIGIN}/`,
+        "X-Requested-With": "XMLHttpRequest",
+        "X-Source": "web",
+        "bx-v": "2.5.31",
+        "bx-umidtoken": candidate.token,
+        "Cookie": cookie,
+      };
+
+      // Get STS upload token
+      const stsRes = await fetch(`${QWEN_BASE}/files/getstsToken`, {
+        method: "POST",
+        headers: uploadHeaders,
+        body: JSON.stringify({ filename, filesize: String(buf.length), filetype: "audio" }),
+      });
+      const stsJson = (await stsRes.json()) as { success?: boolean; data: Record<string, string> };
+      const sts = stsJson.data;
+
+      if (sts["code"] === "RateLimited") {
+        logger.debug({ token: candidate.token.slice(0, 20), detail: sts["details"] }, "audio: token rate limited, rotating");
+        lastErr = `RateLimited: ${sts["details"]}`;
+        continue;
+      }
+      if (!sts["security_token"]) throw new Error(`audio: unexpected STS response: ${JSON.stringify(sts).slice(0, 200)}`);
+
+      // Upload to OSS
+      const date = new Date().toUTCString();
+      const stringToSign = `PUT\n\n${mimeType}\n${date}\nx-oss-security-token:${sts["security_token"]}\n/${sts["bucketname"]}/${sts["file_path"]}`;
+      const sig = createHmac("sha1", sts["access_key_secret"]).update(stringToSign).digest("base64");
+      const putRes = await fetch(`https://${sts["bucketname"]}.${sts["endpoint"]}/${sts["file_path"]}`, {
+        method: "PUT",
+        headers: {
+          "Content-Type": mimeType,
+          "Date": date,
+          "Authorization": `OSS ${sts["access_key_id"]}:${sig}`,
+          "x-oss-security-token": sts["security_token"],
+        },
+        body: buf,
+      });
+      if (!putRes.ok) throw new Error(`audio: OSS PUT failed: ${putRes.status}`);
+
+      // Parse file
+      await fetch(`${QWEN_BASE}/files/parse`, {
+        method: "POST",
+        headers: uploadHeaders,
+        body: JSON.stringify({ file_id: sts["file_id"] }),
+      });
+
+      logger.debug({ file_id: sts["file_id"], token: candidate.token.slice(0, 20) }, "audio: uploaded successfully");
+      return {
+        url: sts["file_url"],
+        type: "audio",
+        file_type: mimeType,
+        file_class: "audio",
+        showType: "audio",
+        status: "uploaded",
+        name: filename,
+        id: sts["file_id"],
+      };
+    } catch (err) {
+      lastErr = String(err);
+      logger.debug({ err: lastErr, token: candidate.token.slice(0, 20) }, "audio: upload attempt failed, trying next token");
+    }
+  }
+  throw new Error(`audio: all ${candidates.length} tokens exhausted. Last error: ${lastErr}`);
+}
+
+/** Upload all audio inputs in parallel with token rotation. Failures are skipped. */
+async function resolveAudioFiles(
+  audioInputs: { url?: string; data?: string; format?: string }[],
+  primaryMidtoken: string,
+): Promise<QwenFileDescriptor[]> {
+  const results = await Promise.all(
+    audioInputs.map(a =>
+      uploadAudioToQwen(a, primaryMidtoken).catch(err => {
+        logger.warn({ err: String(err) }, "audio: upload failed, skipping");
+        return null;
+      }),
+    ),
+  );
+  return results.filter((r): r is QwenFileDescriptor => r !== null);
+}
+
+/** Build plain-text prompt from messages (strips image/audio parts when files[] handles them). */
+function messagesToTextPrompt(messages: NormalisedMessage[], filesHandledByFiles = false): string {
   return messages.map(m => {
     let txt: string;
     if (typeof m.content === "string") {
       txt = m.content;
     } else if (Array.isArray(m.content)) {
-      if (imagesHandledByFiles) {
-        // Strip image parts – they're in files[]
-        txt = (m.content as QwenContentPart[])
-          .filter((p): p is { type: "text"; text: string } => p.type === "text")
-          .map(p => p.text).join("\n");
-      } else {
-        txt = (m.content as QwenContentPart[])
-          .filter((p): p is { type: "text"; text: string } => p.type === "text")
-          .map(p => p.text).join("\n");
-      }
+      // Always strip image_url and input_audio parts — they go in files[]
+      txt = (m.content as QwenContentPart[])
+        .filter((p): p is { type: "text"; text: string } => p.type === "text")
+        .map(p => p.text).join("\n");
     } else {
       txt = "";
     }
@@ -955,21 +1161,31 @@ router.post("/chat/completions", async (req, res) => {
     }
 
     // 7. Build Qwen payload
-    // Detect image content across all messages
-    const allImageUrls = augmentedMessages.flatMap(m => getMessageImages(m.content));
+    // Detect image and audio content across all messages
+    const allImageUrls   = augmentedMessages.flatMap(m => getMessageImages(m.content));
+    const allAudioInputs = augmentedMessages.flatMap(m => getMessageAudios(m.content));
     const isVision = allImageUrls.length > 0;
+    const isAudio  = allAudioInputs.length > 0;
 
-    // Upload images via OSS — uses bx-umidtoken + auto-fetched acw_tc cookie (no session token needed)
+    // Upload images via OSS (bx-umidtoken + auto-fetched acw_tc cookie)
     let resolvedFiles: QwenFileDescriptor[] = [];
     if (isVision) {
       const headers = qwenHeaders(midtoken);
       const cookie = await getQwenCookies(midtoken);
       const uploadHeaders = { ...headers, Cookie: cookie };
-      resolvedFiles = await resolveImageUrls(allImageUrls, uploadHeaders);
-      logger.info({ count: resolvedFiles.length, total: allImageUrls.length }, "vision: images uploaded");
+      const imageFiles = await resolveImageUrls(allImageUrls, uploadHeaders);
+      resolvedFiles.push(...imageFiles);
+      logger.info({ count: imageFiles.length, total: allImageUrls.length }, "vision: images uploaded");
     }
 
-    // Build text prompt (strip image parts when files[] handles them natively)
+    // Upload audio via OSS with automatic token rotation on rate limit
+    if (isAudio) {
+      const audioFiles = await resolveAudioFiles(allAudioInputs, midtoken);
+      resolvedFiles.push(...audioFiles);
+      logger.info({ count: audioFiles.length, total: allAudioInputs.length }, "audio: files uploaded");
+    }
+
+    // Build text prompt (strip image/audio parts — they're handled natively via files[])
     const qwenMessageContent = messagesToTextPrompt(augmentedMessages, resolvedFiles.length > 0);
 
     const qwenPayload = {

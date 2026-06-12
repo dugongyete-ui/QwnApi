@@ -718,6 +718,14 @@ export async function getPooledMidtoken(): Promise<string> {
 }
 
 /**
+ * Return all tokens currently in the pool with their user agents.
+ * Used for per-token rotation (e.g. audio upload rate limit bypass).
+ */
+export function getAllPoolTokens(): { token: string; ua: string }[] {
+  return _pool.filter(e => !!e.token).map(e => ({ token: e.token, ua: e.ua }));
+}
+
+/**
  * Return current pool status — useful for a health/debug endpoint.
  */
 export function getPoolStatus(): { size: number; entries: { ua: string; ageMs: number; hasToken: boolean }[] } {
