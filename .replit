@@ -3,7 +3,7 @@ modules = ["nodejs-24", "python-3.11"]
 [deployment]
 router = "application"
 deploymentTarget = "autoscale"
-run = ["sh", "-c", "PORT=8080 node --enable-source-maps artifacts/api-server/dist/index.mjs"]
+run = ["sh", "-c", "PORT=8080 node artifacts/api-server/dist/index.mjs"]
 build = ["bash", "scripts/build-prod.sh"]
 
 [deployment.postBuild]
