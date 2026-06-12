@@ -1371,21 +1371,22 @@ router.post("/chat/completions", async (req, res) => {
       return;
     }
 
-    // 6. Create chat if no existing session
-    if (!chatId) {
-      chatId = await withSlot(() =>
-        sessionToken
-          ? qwenPyCreate(sessionToken, model)
-          : qwenPyCreate("", model, midtoken),
-        auth.isAdmin
-      );
-    }
+    // 6. Always create a fresh Qwen chat per request.
+    // Guest mode (no QWEN_SESSION_TOKEN) does not persist server-side history, so
+    // we manage the full conversation in our DB and replay it as the prompt each turn.
+    chatId = await withSlot(() =>
+      sessionToken
+        ? qwenPyCreate(sessionToken, model)
+        : qwenPyCreate("", model, midtoken),
+      auth.isAdmin
+    );
 
     // 7. Build Qwen payload
-    // Detect image, audio, and document content across all messages
-    const allImageUrls   = augmentedMessages.flatMap(m => getMessageImages(m.content));
-    const allAudioInputs = augmentedMessages.flatMap(m => getMessageAudios(m.content));
-    const allDocInputs   = augmentedMessages.flatMap(m => getMessageDocuments(m.content));
+    // Detect image, audio, and document content in the current request messages only
+    // (history files were already processed in previous turns)
+    const allImageUrls   = normalisedRequest.flatMap(m => getMessageImages(m.content));
+    const allAudioInputs = normalisedRequest.flatMap(m => getMessageAudios(m.content));
+    const allDocInputs   = normalisedRequest.flatMap(m => getMessageDocuments(m.content));
     const isVision = allImageUrls.length > 0;
     const isAudio  = allAudioInputs.length > 0;
     const isDoc    = allDocInputs.length > 0;
