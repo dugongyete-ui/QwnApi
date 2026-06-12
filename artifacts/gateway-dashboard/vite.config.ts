@@ -26,6 +26,11 @@ if (!basePath) {
   );
 }
 
+// Expose ADMIN_API_KEY to the dashboard so it can auto-authenticate
+// without any manual setup screen. The dashboard is a private admin tool —
+// anyone who can reach the Replit URL is already the owner.
+process.env.VITE_ADMIN_API_KEY = process.env.ADMIN_API_KEY ?? "";
+
 export default defineConfig({
   base: basePath,
   plugins: [
