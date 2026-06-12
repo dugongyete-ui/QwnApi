@@ -1,45 +1,88 @@
-# [Project name]
+# Qwen Chat Gateway
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+Reverse proxy pribadi yang membuat AI Alibaba Qwen bisa diakses melalui API yang kompatibel dengan OpenAI. Kirim request seperti ke OpenAI API, gateway menangani autentikasi ke Qwen secara otomatis.
 
 ## Run & Operate
 
-- `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
-- `pnpm run typecheck` — full typecheck across all packages
-- `pnpm run build` — typecheck + build all packages
-- `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
-- `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL` — Postgres connection string
+- `pnpm --filter @workspace/api-server run dev` — jalankan API server (port 8080)
+- `pnpm --filter @workspace/gateway-dashboard run dev` — jalankan dashboard admin (port 5173)
+- `pnpm run typecheck` — typecheck semua package
+- `pnpm run build` — build semua package
+- `pnpm --filter @workspace/db run push` — push schema DB (dev only)
+
+**Workflows Replit:**
+- **API Server** — backend gateway, port 8080, otomatis rebuild + restart
+- **Dashboard** — UI admin gateway-dashboard
 
 ## Stack
 
 - pnpm workspaces, Node.js 24, TypeScript 5.9
 - API: Express 5
-- DB: PostgreSQL + Drizzle ORM
-- Validation: Zod (`zod/v4`), `drizzle-zod`
-- API codegen: Orval (from OpenAPI spec)
-- Build: esbuild (CJS bundle)
+- DB: PostgreSQL + Drizzle ORM (schema di `lib/db/src/schema/`)
+- Python sidecar: `qwen_cffi.py` (curl_cffi, tanpa `impersonate=` agar bypass Aliyun WAF)
+- Build: esbuild (bundle ESM ke `artifacts/api-server/dist/`)
 
 ## Where things live
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+```
+artifacts/
+  api-server/
+    src/
+      routes/
+        v1.ts       ← SEMUA endpoint OpenAI-compatible (/v1/chat/completions, /v1/models, dll)
+        keys.ts     ← Admin CRUD API keys
+        stats.ts    ← Status token pool & statistik
+        chat.ts     ← Internal chat sessions
+      lib/
+        umid-pool.ts  ← Pool 509 bx-umidtoken, keepalive setiap 50 menit
+        migrate.ts    ← Auto-migrasi DB saat startup
+        logger.ts     ← Pino logger
+    qwen_cffi.py    ← Python sidecar, dipanggil via spawn()
+    token_cache.json← Cache pool token di disk
+  gateway-dashboard/
+    src/pages/      ← UI React admin (keys, stats, playground)
+lib/
+  db/src/schema/    ← Drizzle schema (apiKeys, gatewayStats, chatSessions)
+```
 
 ## Architecture decisions
 
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
+- **Token pool 509 umidtoken**: Qwen membutuhkan `bx-umidtoken` (Alibaba bot-detection token) untuk setiap request. Gateway pre-generate 509 token, simpan ke disk, dan refresh setiap 50 menit via keepalive interval sehingga pool tidak pernah expired saat ada traffic.
+- **Python sidecar untuk request utama**: curl_cffi (Python) mem-bypass TLS fingerprint detection Aliyun lebih baik dari fetch/node-fetch. Server TypeScript spawn sidecar via `child_process.spawn()` bukan `execSync` (async, non-blocking).
+- **Inline text dokumen**: File teks (md, txt, csv, json) di-decode dari base64 dan di-inline langsung ke prompt sebagai `<document>` block, bukan mengandalkan Qwen OSS parse (yang async dan tidak di-poll). Binary files (PDF, DOCX) tetap via OSS.
+- **Vision via OSS upload**: Gambar diunduh gateway lalu di-upload ke Qwen OSS via STS token sebelum dikirim ke model. URL gambar harus bisa diakses oleh server (hindari URL Wikipedia/hotlink-protected).
+- **Audio butuh model omni**: Model text-only (qwen3-30b-a3b, dll.) tidak bisa proses audio meski file terupload. Gunakan `qwen-audio-turbo` atau `qwen2.5-omni-7b` untuk request audio.
 
 ## Product
 
-_Describe the high-level user-facing capabilities of this app once they exist._
+Gateway ini menyediakan:
+- **Chat & streaming** — OpenAI-compatible `/v1/chat/completions` dengan SSE streaming
+- **Vision** — Analisis gambar dari URL atau data URI (gunakan model `qwen-vl-max`)
+- **Dokumen** — Baca file teks/PDF dalam percakapan (`type: "file"` content part)
+- **Audio** — Analisis/transkripsi audio WAV/MP3 (gunakan model `qwen-audio-turbo`)
+- **Image generation** — Generate gambar via `/v1/images/generations`
+- **Admin dashboard** — UI untuk kelola API keys, lihat statistik, playground chat
+
+Lihat **GATEWAY.md** untuk dokumentasi API lengkap beserta contoh kode.
 
 ## User preferences
 
-_Populate as you build — explicit user instructions worth remembering across sessions._
+- Bahasa respon: Indonesia (Bahasa Indonesia) kecuali diminta berbeda.
+- Setiap perbaikan harus ditest langsung dengan curl sebelum dinyatakan selesai.
+- Jangan rewrite from scratch; selalu preserve kode dan struktur yang ada.
 
 ## Gotchas
 
-_Populate as you build — sharp edges, "always run X before Y" rules._
+- **curl_cffi TANPA `impersonate=`**: Jangan tambah `impersonate="chrome120"` atau flag impersonate apapun — ini justru diblokir Aliyun WAF. Versi tanpa impersonate yang bypass.
+- **Port 8080 di Replit**: Server listen di `process.env.PORT` (8080 di Replit dev). Jangan hardcode 5000.
+- **DB migration otomatis**: `runMigrations()` dipanggil saat `app.listen()` — tidak perlu manual migration untuk column baru selama didefinisikan di `migrate.ts`.
+- **Wikipedia image URLs**: Mengembalikan HTTP 400 saat diunduh gateway. Gunakan URL gambar yang tidak memblokir automated download.
+- **`success` column di DB**: Tipe `boolean` bukan `text`. Migration cast otomatis, tapi kalau ada error `invalid input syntax for type boolean` jalankan: `ALTER TABLE gateway_stats ALTER COLUMN success TYPE boolean USING (success::boolean)`.
+- **Rebuild wajib setelah edit `v1.ts`**: Workflow API Server otomatis rebuild (`pnpm run build && pnpm run start`), tapi kalau manual: `pnpm --filter @workspace/api-server run build`.
 
 ## Pointers
 
-- See the `pnpm-workspace` skill for workspace structure, TypeScript setup, and package details
+- Dokumentasi API lengkap: `GATEWAY.md`
+- Schema DB: `lib/db/src/schema/`
+- Token pool logic: `artifacts/api-server/src/lib/umid-pool.ts`
+- Semua endpoint OpenAI-compatible: `artifacts/api-server/src/routes/v1.ts`
