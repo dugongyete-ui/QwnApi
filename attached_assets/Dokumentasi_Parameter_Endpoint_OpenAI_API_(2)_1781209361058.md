@@ -1,4 +1,4 @@
-# Dokumentasi Parameter Endpoint `/v1/chat/completions` OpenAI API
+# Dokumentasi Parameter Endpoint [`/v1/chat/completions` OpenAI API
 
 Dokumen ini menyajikan daftar lengkap parameter yang didukung oleh endpoint `/v1/chat/completions` dari OpenAI API, berdasarkan dokumentasi resmi OpenAI [1] [2]. Pemahaman yang akurat tentang parameter ini sangat penting untuk mengoptimalkan interaksi dengan model chat dan mengontrol output yang dihasilkan.
 

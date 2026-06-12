@@ -9,6 +9,7 @@ import {
   Cpu,
   Menu,
   X,
+  BookOpen,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -25,6 +26,7 @@ export function Layout({ children }: LayoutProps) {
     { href: "/playground", label: "Playground", icon: MessageSquare },
     { href: "/history", label: "History", icon: History },
     { href: "/keys", label: "API Keys", icon: Key },
+    { href: "/api-reference", label: "API Reference", icon: BookOpen },
   ];
 
   const SidebarContent = () => (

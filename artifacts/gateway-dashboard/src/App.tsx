@@ -9,6 +9,7 @@ import Dashboard from "@/pages/dashboard";
 import Playground from "@/pages/playground";
 import History from "@/pages/history";
 import Keys from "@/pages/keys";
+import ApiReference from "@/pages/api-reference";
 import NotFound from "@/pages/not-found";
 
 const queryClient = new QueryClient();
@@ -21,6 +22,7 @@ function Router() {
         <Route path="/playground" component={Playground} />
         <Route path="/history" component={History} />
         <Route path="/keys" component={Keys} />
+        <Route path="/api-reference" component={ApiReference} />
         <Route component={NotFound} />
       </Switch>
     </Layout>
