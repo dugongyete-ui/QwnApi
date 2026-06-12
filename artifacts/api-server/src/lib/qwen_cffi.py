@@ -222,18 +222,27 @@ def cmd_upload(token: str, image_source_b64: str) -> None:
         sys.stdout.flush()
         return
 
-    # Extract CDN URL from response
+    # Extract CDN URL and file_id from response
+    resp_data = data.get("data", {}) or {}
     file_url = (
-        data.get("data", {}).get("url")
-        or data.get("data", {}).get("file_url")
-        or data.get("data", {}).get("cdn_url")
+        resp_data.get("url")
+        or resp_data.get("file_url")
+        or resp_data.get("cdn_url")
     )
+    file_id = resp_data.get("file_id") or resp_data.get("id") or ""
     if not file_url:
         sys.stdout.write(json.dumps({"ok": False, "error": "no_url_in_response", "raw": str(data)[:200]}))
         sys.stdout.flush()
         return
 
-    sys.stdout.write(json.dumps({"ok": True, "url": file_url, "content_type": content_type, "size": len(img_bytes)}))
+    sys.stdout.write(json.dumps({
+        "ok": True,
+        "url": file_url,
+        "file_id": file_id,
+        "filename": filename,
+        "content_type": content_type,
+        "size": len(img_bytes),
+    }))
     sys.stdout.flush()
 
 

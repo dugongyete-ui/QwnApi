@@ -10,8 +10,8 @@
 
 import { Router } from "express";
 import { randomUUID } from "crypto";
-import { createHash, createHmac } from "crypto";
-import { spawn, execFile } from "child_process";
+import { createHash } from "crypto";
+import { spawn } from "child_process";
 import { join } from "path";
 import { withSlot } from "../lib/concurrency";
 import { db } from "@workspace/db";
@@ -437,165 +437,58 @@ interface QwenFileDescriptor {
   showType: string; status: string; name: string; id: string;
 }
 
-/** Get cookies from chat.qwen.ai homepage (needed for getstsToken – no login required). */
-async function getQwenCookies(midtoken: string): Promise<string> {
-  const res = await fetch(QWEN_ORIGIN, {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/138.0.0.0 Safari/537.36",
-      "bx-umidtoken": midtoken,
-    },
-    redirect: "follow",
-  });
-  const setCookie = res.headers.get("set-cookie") || "";
-  return setCookie.split(/,(?=[^ ])/).map((c: string) => c.split(";")[0].trim()).join("; ");
-}
-
-/** Detect MIME type from URL or data URI. */
-function detectMimeType(url: string): string {
-  if (url.startsWith("data:")) { const m = url.match(/^data:([^;,]+)/); return m?.[1] || "image/jpeg"; }
-  const lower = url.toLowerCase();
-  if (lower.includes(".png")) return "image/png";
-  if (lower.includes(".gif")) return "image/gif";
-  if (lower.includes(".webp")) return "image/webp";
-  return "image/jpeg";
-}
-
-/** Fetch image bytes via curl async (handles hotlink protection, TLS issues, etc). */
-function fetchImageBytesViaCurl(url: string): Promise<{ buf: Buffer; mimeType: string; filename: string }> {
-  return new Promise((resolve, reject) => {
-    const args = [
-      "-sL", "--max-time", "20", "--max-filesize", "20971520",
-      "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-      "-H", "Accept: image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-      "-H", "Accept-Language: en-US,en;q=0.9",
-      "-H", "Referer: https://www.google.com/",
-      "--tlsv1.2",
-      "-w", "\n__CONTENT_TYPE__:%{content_type}__STATUS__:%{http_code}",
-      url,
-    ];
-    const chunks: Buffer[] = [];
-    const proc = spawn("curl", args);
-    proc.stdout.on("data", (d: Buffer) => chunks.push(d));
-    proc.stderr.on("data", (d: Buffer) => logger.debug({ msg: d.toString().trim() }, "curl stderr"));
-    const timer = setTimeout(() => { proc.kill(); reject(new Error("curl: timeout")); }, 25000);
-    proc.on("close", (code) => {
-      clearTimeout(timer);
-      if (code !== 0 && code !== null) { reject(new Error(`curl: exit ${code}`)); return; }
-      const result = Buffer.concat(chunks);
-      const raw = result.toString("latin1");
-      const metaMatch = raw.match(/\n__CONTENT_TYPE__:([^_]*)__STATUS__:(\d+)$/);
-      if (!metaMatch) { reject(new Error("curl: failed to parse metadata")); return; }
-      const status = Number(metaMatch[2]);
-      if (status < 200 || status >= 300) { reject(new Error(`curl: HTTP ${status} for ${url}`)); return; }
-      const metaSuffix = `\n__CONTENT_TYPE__:${metaMatch[1]}__STATUS__:${metaMatch[2]}`;
-      const bodyEnd = result.length - Buffer.byteLength(metaSuffix, "latin1");
-      const buf = result.slice(0, bodyEnd);
-      const ctRaw = metaMatch[1].split(";")[0].trim();
-      const mimeType = ctRaw.startsWith("image/") ? ctRaw : detectMimeType(url);
-      const ext = mimeType.split("/")[1]?.replace("jpeg", "jpg") || "jpg";
-      const rawName = url.split("/").pop()?.split("?")[0] || `image.${ext}`;
-      const filename = rawName.includes(".") ? rawName : `${rawName}.${ext}`;
-      resolve({ buf, mimeType, filename });
-    });
-    proc.on("error", (e) => { clearTimeout(timer); reject(e); });
-  });
-}
-
-/** Fetch image bytes – tries Node fetch first, falls back to curl. */
-async function fetchImageBytes(url: string): Promise<{ buf: Buffer; mimeType: string; filename: string }> {
-  if (url.startsWith("data:")) {
-    const m = url.match(/^data:([^;,]+);base64,(.+)$/);
-    if (!m) throw new Error("Invalid data URI");
-    const mimeType = m[1];
-    const buf = Buffer.from(m[2], "base64");
-    const ext = mimeType.split("/")[1]?.replace("jpeg", "jpg") || "jpg";
-    return { buf, mimeType, filename: `image.${ext}` };
-  }
-  try {
-    const res = await fetch(url, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-        "Referer": "https://www.google.com/",
-      },
-      signal: AbortSignal.timeout(15000),
-    });
-    if (res.ok) {
-      const buf = Buffer.from(await res.arrayBuffer());
-      const ct = res.headers.get("content-type")?.split(";")[0].trim() || detectMimeType(url);
-      const mimeType = ct.startsWith("image/") ? ct : detectMimeType(url);
-      const ext = mimeType.split("/")[1]?.replace("jpeg", "jpg") || "jpg";
-      const rawName = url.split("/").pop()?.split("?")[0] || `image.${ext}`;
-      const filename = rawName.includes(".") ? rawName : `${rawName}.${ext}`;
-      return { buf, mimeType, filename };
-    }
-    logger.debug({ status: res.status, url: url.slice(0, 80) }, "vision: fetch failed, retrying with curl");
-  } catch (err) {
-    logger.debug({ err: String(err), url: url.slice(0, 80) }, "vision: fetch error, retrying with curl");
-  }
-  return fetchImageBytesViaCurl(url);
-}
-
 /**
- * Upload one image to Qwen OSS and return a QwenFileDescriptor.
- * Flow: getstsToken → OSS PUT (HMAC-SHA1) → /files/parse → descriptor
- * Works WITHOUT a session token – only needs bx-umidtoken + acw_tc cookie.
+ * Upload one image to Qwen via the Python sidecar (curl_cffi, WAF-safe, authenticated).
+ * imageSource: a URL (https://...) or data URI (data:image/...;base64,...)
+ * Requires QWEN_SESSION_TOKEN — rejects with code "vision_requires_auth" if absent.
  */
-async function uploadImageToQwen(
-  imageUrl: string,
-  uploadHeaders: Record<string, string>,
-): Promise<QwenFileDescriptor> {
-  const { buf, mimeType, filename } = await fetchImageBytes(imageUrl);
-
-  const stsRes = await fetch(`${QWEN_BASE}/files/getstsToken`, {
-    method: "POST",
-    headers: uploadHeaders,
-    body: JSON.stringify({ filename, filesize: String(buf.length), filetype: "image" }),
+function qwenPyUpload(token: string, imageSource: string): Promise<QwenFileDescriptor> {
+  const sourceB64 = Buffer.from(imageSource).toString("base64");
+  const args = [QWEN_CFFI_PY, "upload", token, sourceB64];
+  return new Promise((resolve, reject) => {
+    const py = spawn("python3", args);
+    const chunks: Buffer[] = [];
+    py.stdout.on("data", (d: Buffer) => chunks.push(d));
+    py.stderr.on("data", (d: Buffer) => logger.warn({ err: d.toString().trim() }, "qwen-cffi upload: stderr"));
+    const timer = setTimeout(() => { py.kill(); reject(new Error("qwen-cffi upload: timeout")); }, 60000);
+    py.on("close", () => {
+      clearTimeout(timer);
+      const out = Buffer.concat(chunks).toString("utf8");
+      try {
+        const data = JSON.parse(out) as {
+          ok: boolean; url?: string; file_id?: string; filename?: string;
+          content_type?: string; error?: string; message?: string;
+        };
+        if (!data.ok) {
+          const err = new Error(data.message ?? data.error ?? "vision upload failed");
+          (err as NodeJS.ErrnoException).code = data.error;
+          reject(err);
+          return;
+        }
+        resolve({
+          url: data.url!,
+          type: "image",
+          file_type: data.content_type ?? "image/jpeg",
+          file_class: "vision",
+          showType: "image",
+          status: "uploaded",
+          name: data.filename ?? "image.jpg",
+          id: data.file_id ?? randomUUID(),
+        });
+      } catch (e) { reject(new Error(`qwen-cffi upload: bad output: ${out.slice(0, 200)}`)); }
+    });
+    py.on("error", (e) => { clearTimeout(timer); reject(e); });
   });
-  const stsData = (await stsRes.json()) as {
-    data: { file_id: string; file_url: string; file_path: string; bucketname: string; endpoint: string; access_key_id: string; access_key_secret: string; security_token: string };
-  };
-  const sts = stsData.data;
-
-  const date = new Date().toUTCString();
-  const stringToSign = `PUT\n\n${mimeType}\n${date}\nx-oss-security-token:${sts.security_token}\n/${sts.bucketname}/${sts.file_path}`;
-  const sig = createHmac("sha1", sts.access_key_secret).update(stringToSign).digest("base64");
-
-  const putRes = await fetch(`https://${sts.bucketname}.${sts.endpoint}/${sts.file_path}`, {
-    method: "PUT",
-    headers: {
-      "Content-Type": mimeType, "Date": date,
-      "Authorization": `OSS ${sts.access_key_id}:${sig}`,
-      "x-oss-security-token": sts.security_token,
-    },
-    body: buf,
-  });
-  if (!putRes.ok) {
-    const errText = await putRes.text().catch(() => "");
-    throw new Error(`OSS PUT failed: ${putRes.status} ${errText.slice(0, 200)}`);
-  }
-
-  await fetch(`${QWEN_BASE}/files/parse`, {
-    method: "POST",
-    headers: uploadHeaders,
-    body: JSON.stringify({ file_id: sts.file_id }),
-  });
-
-  return {
-    url: sts.file_url, type: "image", file_type: mimeType,
-    file_class: "vision", showType: "image", status: "uploaded",
-    name: filename, id: sts.file_id,
-  };
 }
 
-/** Upload all images in parallel, skip failures. */
+/** Upload all images in parallel via Python sidecar, skip per-image failures. */
 async function resolveImageUrls(
   imageUrls: string[],
-  uploadHeaders: Record<string, string>,
+  sessionToken: string,
 ): Promise<QwenFileDescriptor[]> {
   const results = await Promise.all(
     imageUrls.map(u =>
-      uploadImageToQwen(u, uploadHeaders).catch(err => {
+      qwenPyUpload(sessionToken, u).catch(err => {
         logger.warn({ err: String(err), url: u.slice(0, 80) }, "vision: image upload failed, skipping");
         return null;
       }),
@@ -943,14 +836,24 @@ router.post("/chat/completions", async (req, res) => {
     const allImageUrls = augmentedMessages.flatMap(m => getMessageImages(m.content));
     const isVision = allImageUrls.length > 0;
 
-    // Upload images to Qwen OSS (no login required – only bx-umidtoken + acw_tc cookie)
+    // Upload images via Python sidecar (requires QWEN_SESSION_TOKEN)
     let resolvedFiles: QwenFileDescriptor[] = [];
     if (isVision) {
-      const effectiveMidtoken = midtoken || (await getPooledMidtoken());
-      const cookie = await getQwenCookies(effectiveMidtoken);
-      const uploadHeaders = { ...qwenHeaders(midtoken), Cookie: cookie };
-      resolvedFiles = await resolveImageUrls(allImageUrls, uploadHeaders);
-      logger.info({ count: resolvedFiles.length, total: allImageUrls.length }, "vision: images uploaded to Qwen OSS");
+      if (!sessionToken) {
+        res.status(400).json({
+          error: {
+            message:
+              "Image analysis requires QWEN_SESSION_TOKEN. " +
+              "Set it to your Qwen Bearer token " +
+              "(open chat.qwen.ai → DevTools → Network → copy the Authorization header value).",
+            type: "invalid_request_error",
+            code: "vision_requires_auth",
+          },
+        });
+        return;
+      }
+      resolvedFiles = await resolveImageUrls(allImageUrls, sessionToken);
+      logger.info({ count: resolvedFiles.length, total: allImageUrls.length }, "vision: images uploaded");
     }
 
     // Build text prompt (strip image parts when files[] handles them natively)
