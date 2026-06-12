@@ -9,12 +9,19 @@ import { warmPool } from "./lib/umid-pool";
 
 const app: Express = express();
 
+const ADMIN_API_KEY = process.env["ADMIN_API_KEY"];
+
 const v1RateLimit = rateLimit({
   windowMs: 60_000,
   max: 60,
   standardHeaders: true,
   legacyHeaders: false,
   validate: { xForwardedForHeader: false, keyGeneratorIpFallback: false },
+  skip: (req) => {
+    if (!ADMIN_API_KEY) return false;
+    const auth = req.headers["authorization"] ?? "";
+    return auth === `Bearer ${ADMIN_API_KEY}`;
+  },
   keyGenerator: (req) => {
     const auth = req.headers["authorization"] ?? "";
     if (typeof auth === "string" && auth.startsWith("Bearer ")) {
