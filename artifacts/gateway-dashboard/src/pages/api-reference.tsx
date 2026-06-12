@@ -33,13 +33,13 @@ interface EndpointDef {
 
 const ENDPOINT_GROUPS: { title: string; description: string; endpoints: EndpointDef[] }[] = [
   {
-    title: "OpenAI-Compatible API",
-    description: "Drop-in replacement for OpenAI API. Use these endpoints with any OpenAI SDK by changing the base URL.",
+    title: "API Endpoints",
+    description: "Endpoint utama yang paling sering digunakan. Kompatibel dengan OpenAI SDK.",
     endpoints: [
       {
         method: "POST",
         path: "/v1/chat/completions",
-        description: "Send a chat message and receive a response from the Qwen model. Supports streaming, vision, and tool calling.",
+        description: "Kirim pesan ke model Qwen dan terima balasan. Mendukung streaming, vision, dan tool calling.",
         auth: true,
         bodySchema: `{
   "model": "qwen-plus" | "qwen-max" | "qwen3-235b-a22b",
@@ -78,7 +78,7 @@ const ENDPOINT_GROUPS: { title: string; description: string; endpoints: Endpoint
       {
         method: "GET",
         path: "/v1/models",
-        description: "List all available Qwen models that can be used in chat completions.",
+        description: "Daftar semua model Qwen yang tersedia dan bisa digunakan di chat completions.",
         auth: true,
         exampleResponse: JSON.stringify(
           {
@@ -93,137 +93,10 @@ const ENDPOINT_GROUPS: { title: string; description: string; endpoints: Endpoint
           2
         ),
       },
-    ],
-  },
-  {
-    title: "Gateway Management API",
-    description: "Internal endpoints for monitoring and managing the gateway. No auth required.",
-    endpoints: [
-      {
-        method: "GET",
-        path: "/api/stats",
-        description: "Get overall gateway usage statistics including success rate, request counts, and average latency.",
-        exampleResponse: JSON.stringify(
-          {
-            totalRequests: 1024,
-            successRequests: 998,
-            failedRequests: 26,
-            successRate: 97.5,
-            averageResponseTime: 1320,
-            requestsToday: 142,
-            requestsThisHour: 18,
-          },
-          null,
-          2
-        ),
-      },
-      {
-        method: "GET",
-        path: "/api/token-pool",
-        description: "Check the health and status of the bx-umidtoken rotation pool used for WAF bypass.",
-        exampleResponse: JSON.stringify(
-          { total: 509, healthy: 505, stale: 4, lastRefreshed: "2024-01-01T12:00:00Z" },
-          null,
-          2
-        ),
-      },
-      {
-        method: "GET",
-        path: "/api/keys",
-        description: "List all provisioned API keys with their status and usage metrics.",
-        exampleResponse: JSON.stringify(
-          {
-            keys: [
-              {
-                id: "key_abc",
-                name: "Production App",
-                keyPreview: "sk-gw-****abcd",
-                isActive: true,
-                requestCount: 512,
-                createdAt: "2024-01-01T00:00:00Z",
-              },
-            ],
-          },
-          null,
-          2
-        ),
-      },
-      {
-        method: "POST",
-        path: "/api/keys",
-        description: "Create a new API key. The full key is only returned once — copy it immediately.",
-        bodySchema: `{ "name": string }`,
-        exampleBody: JSON.stringify({ name: "My App" }, null, 2),
-        exampleResponse: JSON.stringify(
-          {
-            id: "key_xyz",
-            name: "My App",
-            key: "sk-gw-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-            keyPreview: "sk-gw-****xxxx",
-            isActive: true,
-            createdAt: "2024-01-01T00:00:00Z",
-          },
-          null,
-          2
-        ),
-      },
-      {
-        method: "PATCH",
-        path: "/api/keys/:id",
-        description: "Enable or disable an existing API key.",
-        pathParams: [{ name: "id", type: "string", required: true, description: "The API key ID to update." }],
-        bodySchema: `{ "isActive": boolean }`,
-        exampleBody: JSON.stringify({ isActive: false }, null, 2),
-        exampleResponse: JSON.stringify({ id: "key_xyz", isActive: false }, null, 2),
-      },
-      {
-        method: "GET",
-        path: "/api/history",
-        description: "List recent chat sessions with their message count and last activity.",
-        exampleResponse: JSON.stringify(
-          {
-            sessions: [
-              {
-                conversationId: "conv_abc",
-                model: "qwen-plus",
-                messageCount: 6,
-                lastMessage: "2024-01-01T12:00:00Z",
-              },
-            ],
-          },
-          null,
-          2
-        ),
-      },
-      {
-        method: "GET",
-        path: "/api/history/:conversationId",
-        description: "Get the full message history for a specific chat session.",
-        pathParams: [
-          {
-            name: "conversationId",
-            type: "string",
-            required: true,
-            description: "The conversation ID to retrieve.",
-          },
-        ],
-        exampleResponse: JSON.stringify(
-          {
-            conversationId: "conv_abc",
-            model: "qwen-plus",
-            messages: [
-              { role: "user", content: "Hello" },
-              { role: "assistant", content: "Hi! How can I help?" },
-            ],
-          },
-          null,
-          2
-        ),
-      },
       {
         method: "GET",
         path: "/api/healthz",
-        description: "Server health check. Returns 200 OK when the server is running.",
+        description: "Cek status server. Mengembalikan 200 OK jika server sedang berjalan.",
         exampleResponse: JSON.stringify({ status: "ok", uptime: 3600 }, null, 2),
       },
     ],
