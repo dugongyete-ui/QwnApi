@@ -187,6 +187,11 @@ const QWEN_API_MODEL_MAP: Record<string, string> = {
   "qwen2.5-vl-7b-instruct":  "qwen3-30b-a3b",
   "qwen2.5-vl-72b-instruct": "qwen3-235b-a22b",
   "qwen2.5-vl-max":          "qwen3.7-max",
+  // Audio/omni model aliases
+  "qwen-audio-turbo":          "qwen2.5-omni-7b",
+  "qwen2-audio-instruct":      "qwen2.5-omni-7b",
+  "qwen2.5-omni":              "qwen2.5-omni-7b",
+  "qwen2.5-omni-turbo":        "qwen2.5-omni-7b",
 };
 
 function resolveModel(raw: string): string {
@@ -204,16 +209,19 @@ interface ModelEntry {
 const MODELS_CREATED = Math.floor(Date.now() / 1000);
 
 const MODELS: ModelEntry[] = [
-  { id: "qwen3-235b-a22b",  object: "model", created: MODELS_CREATED, owned_by: "qwen-gateway", context_window: 131072 },
-  { id: "qwen3-30b-a3b",    object: "model", created: MODELS_CREATED, owned_by: "qwen-gateway", context_window: 131072 },
-  { id: "qwen3.7-max",      object: "model", created: MODELS_CREATED, owned_by: "qwen-gateway", context_window: 131072 },
-  { id: "qwen3.7-plus",     object: "model", created: MODELS_CREATED, owned_by: "qwen-gateway", context_window: 131072 },
-  { id: "qwen3.6-plus",     object: "model", created: MODELS_CREATED, owned_by: "qwen-gateway", context_window: 131072 },
-  { id: "qwen3.5-flash",    object: "model", created: MODELS_CREATED, owned_by: "qwen-gateway", context_window: 131072 },
-  { id: "qwen3.5-35b-a3b",  object: "model", created: MODELS_CREATED, owned_by: "qwen-gateway", context_window: 131072 },
-  { id: "qwen-plus",        object: "model", created: MODELS_CREATED, owned_by: "qwen-gateway", context_window: 131072 },
-  { id: "qwen-max",         object: "model", created: MODELS_CREATED, owned_by: "qwen-gateway", context_window: 32768  },
-  { id: "qwen-turbo",       object: "model", created: MODELS_CREATED, owned_by: "qwen-gateway", context_window: 131072 },
+  { id: "qwen3-235b-a22b",      object: "model", created: MODELS_CREATED, owned_by: "qwen-gateway", context_window: 131072 },
+  { id: "qwen3-30b-a3b",        object: "model", created: MODELS_CREATED, owned_by: "qwen-gateway", context_window: 131072 },
+  { id: "qwen3.7-max",          object: "model", created: MODELS_CREATED, owned_by: "qwen-gateway", context_window: 131072 },
+  { id: "qwen3.7-plus",         object: "model", created: MODELS_CREATED, owned_by: "qwen-gateway", context_window: 131072 },
+  { id: "qwen3.6-plus",         object: "model", created: MODELS_CREATED, owned_by: "qwen-gateway", context_window: 131072 },
+  { id: "qwen3.5-flash",        object: "model", created: MODELS_CREATED, owned_by: "qwen-gateway", context_window: 131072 },
+  { id: "qwen3.5-35b-a3b",      object: "model", created: MODELS_CREATED, owned_by: "qwen-gateway", context_window: 131072 },
+  { id: "qwen-plus",            object: "model", created: MODELS_CREATED, owned_by: "qwen-gateway", context_window: 131072 },
+  { id: "qwen-max",             object: "model", created: MODELS_CREATED, owned_by: "qwen-gateway", context_window: 32768  },
+  { id: "qwen-turbo",           object: "model", created: MODELS_CREATED, owned_by: "qwen-gateway", context_window: 131072 },
+  { id: "qwen2.5-omni-7b",      object: "model", created: MODELS_CREATED, owned_by: "qwen-gateway", context_window: 32768  },
+  { id: "qwen-audio-turbo",     object: "model", created: MODELS_CREATED, owned_by: "qwen-gateway", context_window: 32768  },
+  { id: "qwen2-audio-instruct", object: "model", created: MODELS_CREATED, owned_by: "qwen-gateway", context_window: 32768  },
 ];
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -990,7 +998,7 @@ async function uploadDocumentToQwen(
         url: sts["file_url"],
         type: "file",
         file_type: mimeType,
-        file_class: "file",
+        file_class: "doc",
         showType: "file",
         status: "uploaded",
         name: filename,
@@ -1020,17 +1028,42 @@ async function resolveDocumentFiles(
   return results.filter((r): r is QwenFileDescriptor => r !== null);
 }
 
-/** Build plain-text prompt from messages (strips image/audio parts when files[] handles them). */
-function messagesToTextPrompt(messages: NormalisedMessage[], filesHandledByFiles = false): string {
+/** MIME types whose base64 content can be decoded and inlined as text. */
+const TEXT_MIME_TYPES = new Set([
+  "text/plain", "text/markdown", "text/csv", "text/html", "text/xml",
+  "application/json", "application/xml", "application/csv",
+]);
+function isTextMimeType(mime: string): boolean {
+  const base = mime.split(";")[0].trim().toLowerCase();
+  return TEXT_MIME_TYPES.has(base) || base.startsWith("text/");
+}
+
+function messagesToTextPrompt(messages: NormalisedMessage[], _filesHandledByFiles = false): string {
   return messages.map(m => {
     let txt: string;
     if (typeof m.content === "string") {
       txt = m.content;
     } else if (Array.isArray(m.content)) {
-      // Always strip image_url and input_audio parts — they go in files[]
-      txt = (m.content as QwenContentPart[])
-        .filter((p): p is { type: "text"; text: string } => p.type === "text")
-        .map(p => p.text).join("\n");
+      const segments: string[] = [];
+      for (const p of m.content as QwenContentPart[]) {
+        if (p.type === "text") {
+          segments.push(p.text);
+        } else if (p.type === "file" && p.file) {
+          // For text-based files with base64 data, inline content so the model
+          // can read it immediately (avoids Qwen OSS parse-completion delay).
+          const f = p.file;
+          if (f.data && f.mime_type && isTextMimeType(f.mime_type)) {
+            try {
+              const decoded = Buffer.from(f.data, "base64").toString("utf-8");
+              const name = f.name ?? "document";
+              segments.push(`<document name="${name}">\n${decoded}\n</document>`);
+            } catch { /* skip non-decodable */ }
+          }
+          // Binary files (PDF, DOCX…) and URL-only refs are handled by files[]
+        }
+        // image_url and input_audio go in files[] — not inlined as text
+      }
+      txt = segments.join("\n");
     } else {
       txt = "";
     }
