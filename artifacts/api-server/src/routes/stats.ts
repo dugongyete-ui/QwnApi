@@ -2,7 +2,7 @@ import { Router } from "express";
 import { db } from "@workspace/db";
 import { gatewayStatsTable, requestLogsTable, apiKeysTable } from "@workspace/db";
 import { eq, gte, count } from "drizzle-orm";
-import { getPoolStatus, warmPool } from "../lib/umid-pool";
+import { getPoolStatus, forceRefresh } from "../lib/umid-pool";
 
 const router = Router();
 
@@ -55,10 +55,10 @@ router.get("/token-pool", (_req, res) => {
   res.json(getPoolStatus());
 });
 
-/** POST /api/token-pool/refresh — trigger a background re-warm of the pool */
+/** POST /api/token-pool/refresh — force immediate refresh of all pre-expired tokens */
 router.post("/token-pool/refresh", (_req, res) => {
-  warmPool();
-  res.json({ ok: true, message: "Pool re-warm triggered", status: getPoolStatus() });
+  forceRefresh();
+  res.json({ ok: true, message: "Token refresh triggered", status: getPoolStatus() });
 });
 
 export default router;

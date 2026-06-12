@@ -4,7 +4,9 @@ import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 
 const UMID_URL = "https://sg-wum.alibaba.com/w/wu.json";
-const TOKEN_TTL = 3600_000; // 1 hour
+const TOKEN_TTL      = 3600_000; // 1 hour (hard expiry)
+const PRE_EXPIRE_MS  =  50 * 60_000; // proactively refresh at 50 min, before 1h expiry
+const KEEPALIVE_INTERVAL_MS = 50 * 60_000; // background keepalive every 50 min
 
 // Path to the token cache file written by warmup_tokens.py.
 // Lives one level ABOVE dist/ so it survives build cleans.
@@ -671,29 +673,58 @@ async function initPool(): Promise<void> {
   return _initPromise;
 }
 
-async function refreshExpired(): Promise<void> {
-  const now = Date.now();
-  const stale = _pool.filter((e) => now - e.ts >= TOKEN_TTL);
-  if (stale.length === 0) return;
+let _refreshing = false;
 
-  await Promise.allSettled(
-    stale.map(async (entry) => {
-      const token = await fetchToken(entry.ua);
-      if (token) {
-        entry.token = token;
-        entry.ts = Date.now();
-        logger.debug("bx-umidtoken refreshed in pool");
-      }
-    })
-  );
+async function refreshExpired(): Promise<void> {
+  if (_refreshing) return;
+  _refreshing = true;
+  try {
+    const now = Date.now();
+    const stale = _pool.filter((e) => now - e.ts >= PRE_EXPIRE_MS);
+    if (stale.length === 0) return;
+
+    logger.info({ count: stale.length }, "bx-umidtoken keepalive: refreshing pre-expired tokens");
+    const BATCH = 10;
+    for (let i = 0; i < stale.length; i += BATCH) {
+      await Promise.allSettled(
+        stale.slice(i, i + BATCH).map(async (entry) => {
+          const token = await fetchToken(entry.ua);
+          if (token) {
+            entry.token = token;
+            entry.ts = Date.now();
+          }
+        })
+      );
+    }
+    logger.info({ refreshed: stale.length }, "bx-umidtoken keepalive: done");
+  } finally {
+    _refreshing = false;
+  }
 }
 
 /**
  * Start warming the pool in the background without blocking.
  * Call this at server startup so the pool is ready before the first request arrives.
+ * Also starts the background keepalive interval that proactively refreshes tokens
+ * before they expire — pool stays ready even with zero traffic.
  */
 export function warmPool(): void {
-  if (!_initializing) void initPool();
+  if (!_initializing) {
+    void initPool();
+    // Proactively refresh tokens every 50 min (before 1h TTL).
+    // .unref() ensures this doesn't prevent a clean process exit.
+    setInterval(() => {
+      void refreshExpired();
+    }, KEEPALIVE_INTERVAL_MS).unref();
+  }
+}
+
+/**
+ * Force an immediate refresh of all pre-expired tokens.
+ * Called by the manual /api/token-pool/refresh endpoint.
+ */
+export function forceRefresh(): void {
+  void refreshExpired();
 }
 
 /**
