@@ -281,20 +281,28 @@ interface ChatCompletionRequest {
 
 // ─── Auth helper ──────────────────────────────────────────────────────────────
 
+const ADMIN_API_KEY = process.env["ADMIN_API_KEY"];
+
 async function resolveApiKey(authHeader: string | undefined): Promise<
-  { ok: true; keyId: string } | { ok: false; statusCode: number; error: string }
+  { ok: true; keyId: string; isAdmin: boolean } | { ok: false; statusCode: number; error: string }
 > {
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
     return { ok: false, statusCode: 401, error: "Missing or malformed Authorization header. Expected: Bearer <key>" };
   }
   const key = authHeader.slice(7).trim();
   if (!key) return { ok: false, statusCode: 401, error: "Empty API key" };
+
+  // Owner key — bypass DB lookup entirely
+  if (ADMIN_API_KEY && key === ADMIN_API_KEY) {
+    return { ok: true, keyId: "admin", isAdmin: true };
+  }
+
   const hash = createHash("sha256").update(key).digest("hex");
   const rows = await db.select().from(apiKeysTable).where(eq(apiKeysTable.keyHash, hash));
   const row = rows[0];
   if (!row) return { ok: false, statusCode: 401, error: "Invalid API key" };
   if (!row.isActive) return { ok: false, statusCode: 403, error: "API key is inactive" };
-  return { ok: true, keyId: row.id };
+  return { ok: true, keyId: row.id, isAdmin: false };
 }
 
 async function incrementKeyUsage(keyId: string) {
@@ -889,7 +897,8 @@ router.post("/chat/completions", async (req, res) => {
       chatId = await withSlot(() =>
         sessionToken
           ? qwenPyCreate(sessionToken, model)
-          : qwenPyCreate("", model, midtoken)
+          : qwenPyCreate("", model, midtoken),
+        auth.isAdmin
       );
     }
 
@@ -940,7 +949,8 @@ router.post("/chat/completions", async (req, res) => {
     const getBody = () => withSlot(() =>
       sessionToken
         ? qwenPyBody(sessionToken, chatId!, qwenPayload)
-        : qwenPyBody("", chatId!, qwenPayload, midtoken)
+        : qwenPyBody("", chatId!, qwenPayload, midtoken),
+      auth.isAdmin
     );
 
     // ── STREAMING path ──────────────────────────────────────────────────────
@@ -1143,7 +1153,8 @@ router.post("/completions", async (req, res) => {
     const chatId = await withSlot(() =>
       sessionToken
         ? qwenPyCreate(sessionToken, model)
-        : qwenPyCreate("", model, midtoken)
+        : qwenPyCreate("", model, midtoken),
+      auth.isAdmin
     );
 
     const qwenPayload = {
@@ -1159,7 +1170,8 @@ router.post("/completions", async (req, res) => {
     const rawBody = await withSlot(() =>
       sessionToken
         ? qwenPyBody(sessionToken, chatId, qwenPayload)
-        : qwenPyBody("", chatId, qwenPayload, midtoken)
+        : qwenPyBody("", chatId, qwenPayload, midtoken),
+      auth.isAdmin
     );
 
     checkQwenWaf(rawBody);

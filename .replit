@@ -70,3 +70,8 @@ externalPort = 3000
 
 [nix]
 channel = "stable-25_05"
+
+[userenv]
+
+[userenv.shared]
+ADMIN_API_KEY = "sk-dzeck-1ee392d1f9ff4d317c6a4c311e84efa0he"

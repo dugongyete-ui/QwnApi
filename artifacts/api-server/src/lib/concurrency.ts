@@ -66,8 +66,10 @@ export function release(): void {
 /**
  * Run a function inside a concurrency slot.
  * Automatically releases the slot when done (or on error).
+ * Pass isAdmin=true to bypass the semaphore entirely.
  */
-export async function withSlot<T>(fn: () => Promise<T>): Promise<T> {
+export async function withSlot<T>(fn: () => Promise<T>, isAdmin = false): Promise<T> {
+  if (isAdmin) return fn();
   await acquire();
   try {
     return await fn();
