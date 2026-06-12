@@ -4,20 +4,19 @@ import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { ScrollArea } from "@/components/ui/scroll-area";
-import { Send, Terminal, Cpu, Trash2, ChevronDown } from "lucide-react";
+import { Send, Terminal, Cpu, Trash2, ChevronDown, Clock } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { useState as useCollapseState } from "react";
 
 type LocalMessage = {
   role: "user" | "assistant";
   content: string;
   thinking?: string | null;
   timestamp: string;
+  elapsed?: number;
 };
 
 function ThinkingBlock({ content }: { content: string }) {
-  const [open, setOpen] = useCollapseState(false);
+  const [open, setOpen] = useState(false);
   return (
     <div className="mb-2 border border-border/50 rounded-md overflow-hidden">
       <button
@@ -36,11 +35,42 @@ function ThinkingBlock({ content }: { content: string }) {
   );
 }
 
+function LoadingIndicator({ elapsed }: { elapsed: number }) {
+  const isLong = elapsed >= 15;
+  const isVeryLong = elapsed >= 45;
+
+  return (
+    <div className="p-3 rounded-md bg-muted border border-border text-foreground space-y-2">
+      <div className="flex gap-1.5 items-center">
+        <span className="animate-bounce inline-block w-1.5 h-1.5 bg-primary rounded-full" style={{ animationDelay: "0ms" }} />
+        <span className="animate-bounce inline-block w-1.5 h-1.5 bg-primary rounded-full" style={{ animationDelay: "150ms" }} />
+        <span className="animate-bounce inline-block w-1.5 h-1.5 bg-primary rounded-full" style={{ animationDelay: "300ms" }} />
+        <span className="text-xs text-muted-foreground font-mono ml-1.5 flex items-center gap-1">
+          <Clock className="w-3 h-3" />
+          {elapsed}s
+        </span>
+      </div>
+      {isVeryLong && (
+        <p className="text-xs text-amber-400/80 font-mono">
+          &gt; Image generation in progress — Qwen is rendering (~20–60s total)
+        </p>
+      )}
+      {isLong && !isVeryLong && (
+        <p className="text-xs text-muted-foreground/70 font-mono">
+          &gt; Still working... heavy models or image gen can take up to 60s
+        </p>
+      )}
+    </div>
+  );
+}
+
 export default function Playground() {
   const [prompt, setPrompt] = useState("");
   const [model, setModel] = useState<string>("");
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [messages, setMessages] = useState<LocalMessage[]>([]);
+  const [elapsed, setElapsed] = useState(0);
+  const elapsedRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -60,7 +90,24 @@ export default function Playground() {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [messages, sendChat.isPending]);
+  }, [messages, sendChat.isPending, elapsed]);
+
+  useEffect(() => {
+    if (sendChat.isPending) {
+      setElapsed(0);
+      elapsedRef.current = setInterval(() => {
+        setElapsed((e) => e + 1);
+      }, 1000);
+    } else {
+      if (elapsedRef.current) {
+        clearInterval(elapsedRef.current);
+        elapsedRef.current = null;
+      }
+    }
+    return () => {
+      if (elapsedRef.current) clearInterval(elapsedRef.current);
+    };
+  }, [sendChat.isPending]);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -75,10 +122,12 @@ export default function Playground() {
     setMessages((prev) => [...prev, userMessage]);
     setPrompt("");
 
+    const sendStart = Date.now();
     sendChat.mutate(
       { data: { prompt: userMessage.content, model, conversationId: conversationId || undefined } },
       {
         onSuccess: (res) => {
+          const took = Math.round((Date.now() - sendStart) / 1000);
           setConversationId(res.conversationId);
           setMessages((prev) => [
             ...prev,
@@ -87,6 +136,7 @@ export default function Playground() {
               content: res.response,
               thinking: res.thinking ?? null,
               timestamp: new Date().toISOString(),
+              elapsed: took,
             },
           ]);
         },
@@ -165,8 +215,14 @@ export default function Playground() {
                   )}
                   data-testid={`message-${msg.role}-${i}`}
                 >
-                  <div className="text-xs text-muted-foreground font-mono mb-1 uppercase opacity-70">
+                  <div className="text-xs text-muted-foreground font-mono mb-1 uppercase opacity-70 flex items-center gap-2">
                     {msg.role}
+                    {msg.elapsed !== undefined && msg.elapsed > 0 && (
+                      <span className="flex items-center gap-0.5 opacity-50">
+                        <Clock className="w-2.5 h-2.5" />
+                        {msg.elapsed}s
+                      </span>
+                    )}
                   </div>
 
                   {msg.role === "assistant" && msg.thinking && (
@@ -190,11 +246,7 @@ export default function Playground() {
                   <div className="text-xs text-muted-foreground font-mono mb-1 uppercase opacity-70">
                     assistant
                   </div>
-                  <div className="p-3 rounded-md bg-muted border border-border text-foreground flex gap-1.5 items-center">
-                    <span className="animate-bounce inline-block w-1.5 h-1.5 bg-primary rounded-full" style={{ animationDelay: "0ms" }} />
-                    <span className="animate-bounce inline-block w-1.5 h-1.5 bg-primary rounded-full" style={{ animationDelay: "150ms" }} />
-                    <span className="animate-bounce inline-block w-1.5 h-1.5 bg-primary rounded-full" style={{ animationDelay: "300ms" }} />
-                  </div>
+                  <LoadingIndicator elapsed={elapsed} />
                 </div>
               )}
             </div>

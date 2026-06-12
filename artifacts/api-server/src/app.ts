@@ -1,4 +1,4 @@
-import express, { type Express } from "express";
+import express, { type Express, type Request, type Response, type NextFunction } from "express";
 import cors from "cors";
 import pinoHttp from "pino-http";
 import rateLimit from "express-rate-limit";
@@ -10,6 +10,20 @@ import { warmPool } from "./lib/umid-pool";
 const app: Express = express();
 
 const ADMIN_API_KEY = process.env["ADMIN_API_KEY"];
+
+/**
+ * Per-device auth for /api/* endpoints.
+ * Every request must carry Authorization: Bearer <ADMIN_API_KEY>.
+ * The dashboard stores the key in localStorage and injects it automatically.
+ * /healthz is exempt so health checks never need credentials.
+ */
+function apiAuthMiddleware(req: Request, res: Response, next: NextFunction): void {
+  if (req.path === "/healthz") { next(); return; }
+  if (!ADMIN_API_KEY) { next(); return; }
+  const auth = req.headers["authorization"];
+  if (typeof auth === "string" && auth === `Bearer ${ADMIN_API_KEY}`) { next(); return; }
+  res.status(401).json({ error: { message: "Unauthorized — valid ADMIN_API_KEY required", type: "auth_error", code: "unauthorized" } });
+}
 
 const v1RateLimit = rateLimit({
   windowMs: 60_000,
@@ -64,7 +78,7 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-app.use("/api", router);
+app.use("/api", apiAuthMiddleware, router);
 app.use("/v1", v1RateLimit, v1Router);
 
 // Warm the bx-umidtoken pool at startup (non-blocking)

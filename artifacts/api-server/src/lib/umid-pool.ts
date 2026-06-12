@@ -703,6 +703,16 @@ async function refreshExpired(): Promise<void> {
 }
 
 /**
+ * Await this to block until the first batch of tokens is available.
+ * Resolves instantly if token_cache.json was loaded (sync disk read).
+ * Use in index.ts to guarantee the pool is ready before accepting traffic.
+ */
+export async function waitForFirstBatch(): Promise<void> {
+  if (!_initializing) void initPool();
+  await _firstBatchReady;
+}
+
+/**
  * Start warming the pool in the background without blocking.
  * Call this at server startup so the pool is ready before the first request arrives.
  * Also starts the background keepalive interval that proactively refreshes tokens
