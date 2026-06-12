@@ -19,6 +19,7 @@ Semua endpoint `/v1/*` membutuhkan API key di header `Authorization`:
 
 ```
 Authorization: Bearer gw_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+ADMIN_API_KEY Bearer sk-dzeckxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
 **Format API key:** Key baru yang dibuat via `/api/keys` memiliki prefix `gw_` diikuti 32 karakter hex. Key yang diinsert manual ke DB bisa memiliki format custom.
