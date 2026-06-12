@@ -54,6 +54,10 @@ export default function Keys() {
           setCreatedKeyData({ name: res.name, key: res.key });
           setNewKeyName("");
         },
+        onError: (err: unknown) => {
+          const msg = err instanceof Error ? err.message : "Failed to generate key";
+          toast({ title: "Error", description: msg, variant: "destructive" });
+        },
       }
     );
   };
