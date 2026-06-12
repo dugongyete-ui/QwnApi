@@ -1,3 +1,5 @@
 - [Qwen WAF bypass](qwen-waf-bypass.md) — curl_cffi WITHOUT impersonate= bypasses Aliyun WAF; with impersonate="chrome120" is blocked.
-- [Qwen V2 API model names](qwen-v2-models.md) — Old model names (qwen-turbo/plus/max) return Not_Found on V2 endpoint; use qwen3-235b-a22b, qwen3-30b-a3b, qwen3.7-max, qwen3.7-plus.
-- [Qwen V2 engine interface](qwen-v2-engine.md) — V2 uses qwen_cffi.py via CLI args + streaming SSE, not stdin JSON. Endpoint: /api/v2/chats/new + /api/v2/chat/completions?chat_id=.
+- [Qwen V2 API model names](qwen-v2-models.md) — Only 3 models in API list; wanx/flux not accessible at completions; see alias map.
+- [Qwen V2 engine interface](qwen-v2-engine.md) — Python sidecar CLI, chat creation, completions URL, OSS upload, SSE parsing.
+- [Qwen audio upload + token rotation](qwen-audio-upload.md) — filetype "audio" OSS flow; rotate getAllPoolTokens() when RateLimited.
+- [Qwen image generation t2i trick](qwen-image-generation.md) — use qwen3.7-plus + chat_type/sub_chat_type "t2i" inside message object; NOT wanx model names.
