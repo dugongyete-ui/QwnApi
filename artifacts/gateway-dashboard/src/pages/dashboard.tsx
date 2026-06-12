@@ -87,10 +87,10 @@ export default function Dashboard() {
             ) : (
               <>
                 <div className="text-3xl md:text-4xl font-bold font-mono">
-                  {stats?.requestsToday.toLocaleString()}
+                  {(stats?.requestsToday ?? 0).toLocaleString()}
                 </div>
                 <p className="text-xs text-muted-foreground mt-1 hidden sm:block">
-                  {stats?.requestsThisHour.toLocaleString()} this hour
+                  {(stats?.requestsThisHour ?? 0).toLocaleString()} this hour
                 </p>
               </>
             )}
