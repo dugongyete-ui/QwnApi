@@ -11,7 +11,7 @@
 import { Router } from "express";
 import { randomUUID } from "crypto";
 import { createHash, createHmac } from "crypto";
-import { spawn } from "child_process";
+import { spawn, execFile } from "child_process";
 import { join } from "path";
 import { withSlot } from "../lib/concurrency";
 import { db } from "@workspace/db";
@@ -460,33 +460,45 @@ function detectMimeType(url: string): string {
   return "image/jpeg";
 }
 
-/** Fetch image bytes via curl (handles hotlink protection, TLS issues, etc). */
-function fetchImageBytesViaCurl(url: string): { buf: Buffer; mimeType: string; filename: string } {
-  const result = execSync(
-    `curl -sL --max-time 20 --max-filesize 20971520 \
-      -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36" \
-      -H "Accept: image/avif,image/webp,image/apng,image/*,*/*;q=0.8" \
-      -H "Accept-Language: en-US,en;q=0.9" \
-      -H "Referer: https://www.google.com/" \
-      --tlsv1.2 \
-      -w "\\n__CONTENT_TYPE__:%{content_type}__STATUS__:%{http_code}" \
-      "${url.replace(/"/g, '\\"')}"`,
-    { maxBuffer: 25 * 1024 * 1024, encoding: "buffer" },
-  ) as unknown as Buffer;
-  const raw = result.toString("latin1");
-  const metaMatch = raw.match(/\n__CONTENT_TYPE__:([^_]*)__STATUS__:(\d+)$/);
-  if (!metaMatch) throw new Error("curl: failed to parse metadata");
-  const status = Number(metaMatch[2]);
-  if (status < 200 || status >= 300) throw new Error(`curl: HTTP ${status} for ${url}`);
-  const metaSuffix = `\n__CONTENT_TYPE__:${metaMatch[1]}__STATUS__:${metaMatch[2]}`;
-  const bodyEnd = result.length - Buffer.byteLength(metaSuffix, "latin1");
-  const buf = result.slice(0, bodyEnd);
-  const ctRaw = metaMatch[1].split(";")[0].trim();
-  const mimeType = ctRaw.startsWith("image/") ? ctRaw : detectMimeType(url);
-  const ext = mimeType.split("/")[1]?.replace("jpeg", "jpg") || "jpg";
-  const rawName = url.split("/").pop()?.split("?")[0] || `image.${ext}`;
-  const filename = rawName.includes(".") ? rawName : `${rawName}.${ext}`;
-  return { buf, mimeType, filename };
+/** Fetch image bytes via curl async (handles hotlink protection, TLS issues, etc). */
+function fetchImageBytesViaCurl(url: string): Promise<{ buf: Buffer; mimeType: string; filename: string }> {
+  return new Promise((resolve, reject) => {
+    const args = [
+      "-sL", "--max-time", "20", "--max-filesize", "20971520",
+      "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+      "-H", "Accept: image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+      "-H", "Accept-Language: en-US,en;q=0.9",
+      "-H", "Referer: https://www.google.com/",
+      "--tlsv1.2",
+      "-w", "\n__CONTENT_TYPE__:%{content_type}__STATUS__:%{http_code}",
+      url,
+    ];
+    const chunks: Buffer[] = [];
+    const proc = spawn("curl", args);
+    proc.stdout.on("data", (d: Buffer) => chunks.push(d));
+    proc.stderr.on("data", (d: Buffer) => logger.debug({ msg: d.toString().trim() }, "curl stderr"));
+    const timer = setTimeout(() => { proc.kill(); reject(new Error("curl: timeout")); }, 25000);
+    proc.on("close", (code) => {
+      clearTimeout(timer);
+      if (code !== 0 && code !== null) { reject(new Error(`curl: exit ${code}`)); return; }
+      const result = Buffer.concat(chunks);
+      const raw = result.toString("latin1");
+      const metaMatch = raw.match(/\n__CONTENT_TYPE__:([^_]*)__STATUS__:(\d+)$/);
+      if (!metaMatch) { reject(new Error("curl: failed to parse metadata")); return; }
+      const status = Number(metaMatch[2]);
+      if (status < 200 || status >= 300) { reject(new Error(`curl: HTTP ${status} for ${url}`)); return; }
+      const metaSuffix = `\n__CONTENT_TYPE__:${metaMatch[1]}__STATUS__:${metaMatch[2]}`;
+      const bodyEnd = result.length - Buffer.byteLength(metaSuffix, "latin1");
+      const buf = result.slice(0, bodyEnd);
+      const ctRaw = metaMatch[1].split(";")[0].trim();
+      const mimeType = ctRaw.startsWith("image/") ? ctRaw : detectMimeType(url);
+      const ext = mimeType.split("/")[1]?.replace("jpeg", "jpg") || "jpg";
+      const rawName = url.split("/").pop()?.split("?")[0] || `image.${ext}`;
+      const filename = rawName.includes(".") ? rawName : `${rawName}.${ext}`;
+      resolve({ buf, mimeType, filename });
+    });
+    proc.on("error", (e) => { clearTimeout(timer); reject(e); });
+  });
 }
 
 /** Fetch image bytes – tries Node fetch first, falls back to curl. */
@@ -620,8 +632,8 @@ function messagesToTextPrompt(messages: NormalisedMessage[], imagesHandledByFile
 
 // ─── Stop sequence / tool detection ──────────────────────────────────────────
 
-function applyStop(content: string, stop: string | string[] | null | undefined): { content: string; truncated: boolean } {
-  if (!stop) return { content, truncated: false };
+function applyStop(content: string, stop: string | string[] | null | undefined): { content: string; hitStop: boolean } {
+  if (!stop) return { content, hitStop: false };
   const stops = Array.isArray(stop) ? stop : [stop];
   let earliest = content.length;
   for (const s of stops) {
@@ -630,11 +642,15 @@ function applyStop(content: string, stop: string | string[] | null | undefined):
     if (idx !== -1 && idx < earliest) earliest = idx;
   }
   return earliest < content.length
-    ? { content: content.slice(0, earliest), truncated: true }
-    : { content, truncated: false };
+    ? { content: content.slice(0, earliest), hitStop: true }
+    : { content, hitStop: false };
 }
 
-function detectToolCalls(raw: string, tools: ChatCompletionRequest["tools"]): ToolCall[] | null {
+function detectToolCalls(
+  raw: string,
+  tools: ChatCompletionRequest["tools"],
+  parallelToolCalls = true,
+): ToolCall[] | null {
   if (!tools || tools.length === 0) return null;
   const trimmed = raw.trim().replace(/```(?:json)?/gi, "").trim();
 
@@ -669,11 +685,15 @@ function detectToolCalls(raw: string, tools: ChatCompletionRequest["tools"]): To
                 arguments: typeof tc.arguments === "string" ? tc.arguments : JSON.stringify(tc.arguments ?? {}),
               },
             });
+            // Honour parallel_tool_calls: false — stop after first call
+            if (!parallelToolCalls) break;
           }
         }
       } catch { /* skip malformed */ }
     }
     searchFrom = blockEnd + 1;
+    // Honour parallel_tool_calls: false — stop after first block
+    if (!parallelToolCalls && allCalls.length > 0) break;
   }
   return allCalls.length > 0 ? allCalls : null;
 }
@@ -766,16 +786,32 @@ function resolveThinking(effort: ChatCompletionRequest["reasoning_effort"]): {
   }
 }
 
-function injectToolPrompt(messages: NormalisedMessage[], tools: ChatCompletionRequest["tools"]): NormalisedMessage[] {
+function injectToolPrompt(
+  messages: NormalisedMessage[],
+  tools: ChatCompletionRequest["tools"],
+  toolChoice: ChatCompletionRequest["tool_choice"] = "auto",
+): NormalisedMessage[] {
   if (!tools || tools.length === 0) return messages;
   const defs = tools.map(t => {
     const f = t.function;
     return `- ${f.name}: ${f.description ?? "(no description)"} | params: ${JSON.stringify(f.parameters ?? {})}`;
   }).join("\n");
 
-  const systemBlock = `You have access to external tools. When a tool is needed, output ONLY a single raw JSON:
+  // Determine tool usage instruction based on tool_choice
+  let choiceInstruction: string;
+  if (toolChoice === "required") {
+    choiceInstruction = "You MUST call one of the available tools. Do NOT respond with plain text.";
+  } else if (typeof toolChoice === "object" && toolChoice !== null && toolChoice.type === "function") {
+    const forcedName = toolChoice.function.name;
+    choiceInstruction = `You MUST call the tool named "${forcedName}". Do NOT respond with plain text.`;
+  } else {
+    // "auto" or unset — model decides
+    choiceInstruction = "When a tool is needed, call it. When not, respond normally in plain text.";
+  }
+
+  const systemBlock = `You have access to external tools. ${choiceInstruction}
+When calling a tool, output ONLY a single raw JSON object — no prose, no markdown:
 {"tool_calls":[{"name":"TOOL_NAME","arguments":{...}}]}
-Do NOT output anything else when calling tools. When not calling a tool, respond normally in plain text.
 
 AVAILABLE TOOLS:\n${defs}`;
 
@@ -879,7 +915,7 @@ router.post("/chat/completions", async (req, res) => {
       : normalisedRequest;
 
     // Inject tool prompt first, then json-mode instruction (outermost system block wins)
-    const withTools      = hasTools ? injectToolPrompt(allMessages, body.tools) : allMessages;
+    const withTools      = hasTools ? injectToolPrompt(allMessages, body.tools, body.tool_choice) : allMessages;
     const augmentedMessages = wantsJson ? injectJsonMode(withTools, body.response_format) : withTools;
 
     // 5. Get auth token or midtoken
@@ -970,12 +1006,14 @@ router.post("/chat/completions", async (req, res) => {
       }
 
       const stResult = applyStop(rawContent, _stop);
-      const finishReason = stResult.truncated ? "length" : "stop";
+      // stop sequence hit → "stop"; normal completion → "stop"; only max_tokens → "length" (not detectable here)
+      const finishReason = "stop";
       // response_format: json_object — strip prose/fences from content
       const streamContent = wantsJson ? extractJson(stResult.content) : stResult.content;
 
       // Check for tool calls
-      const toolCalls = hasTools ? detectToolCalls(streamContent, body.tools) : null;
+      const parallelToolCalls = body.parallel_tool_calls !== false;
+      const toolCalls = hasTools ? detectToolCalls(streamContent, body.tools, parallelToolCalls) : null;
 
       if (toolCalls) {
         res.write(sseChunk(completionId, _rawModel, created, { role: "assistant", content: null }, null));
@@ -1028,11 +1066,12 @@ router.post("/chat/completions", async (req, res) => {
       return;
     }
 
+    const parallelToolCalls = body.parallel_tool_calls !== false;
     const choices = parsed.map((p, idx) => {
       const stRes = applyStop(p.content, _stop);
       let content = stRes.content;
-      const finishReason = stRes.truncated ? "length" : "stop";
-      const toolCalls = hasTools ? detectToolCalls(content, body.tools) : null;
+      const finishReason = "stop";
+      const toolCalls = hasTools ? detectToolCalls(content, body.tools, parallelToolCalls) : null;
 
       // response_format: json_object — extract raw JSON from the content
       if (wantsJson && !toolCalls) content = extractJson(content);
@@ -1185,7 +1224,7 @@ router.post("/completions", async (req, res) => {
 
     const stRes = applyStop(rawContent, _stop);
     const content = stRes.content;
-    const finishReason = stRes.truncated ? "length" : "stop";
+    const finishReason = "stop";
 
     await recordRequest(true, Date.now() - startTime, _rawModel);
     await incrementKeyUsage(auth.keyId);
