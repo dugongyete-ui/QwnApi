@@ -26,15 +26,8 @@ if (!basePath) {
   );
 }
 
-const adminApiKey = process.env.ADMIN_API_KEY ?? "";
-
 export default defineConfig({
   base: basePath,
-  define: {
-    // Embed ADMIN_API_KEY directly into the bundle so the dashboard
-    // auto-authenticates without a setup screen on every device.
-    "import.meta.env.VITE_ADMIN_API_KEY": JSON.stringify(adminApiKey),
-  },
   plugins: [
     react(),
     tailwindcss(),
