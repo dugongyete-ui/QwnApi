@@ -225,7 +225,8 @@ const SYSTEM_FINGERPRINT = "fp_qwen_gateway_v2";
 type QwenContentPart =
   | { type: "text"; text: string }
   | { type: "image_url"; image_url: { url: string } }
-  | { type: "input_audio"; input_audio: { url?: string; data?: string; format?: string } };
+  | { type: "input_audio"; input_audio: { url?: string; data?: string; format?: string } }
+  | { type: "file"; file: { url?: string; data?: string; mime_type?: string; name?: string } };
 
 interface OpenAIMessage {
   role: "system" | "user" | "assistant" | "tool";
@@ -421,8 +422,8 @@ function normaliseMessages(messages: OpenAIMessage[]): NormalisedMessage[] {
       return { role, content: contentToText(m) };
     }
 
-    // User message: check if it has images or audio
-    if (Array.isArray(m.content) && m.content.some((p) => p.type === "image_url" || p.type === "input_audio")) {
+    // User message: check if it has images, audio, or files
+    if (Array.isArray(m.content) && m.content.some((p) => p.type === "image_url" || p.type === "input_audio" || p.type === "file")) {
       const parts: QwenContentPart[] = [];
       for (const p of m.content) {
         if (p.type === "image_url" && p.image_url?.url) {
@@ -430,6 +431,9 @@ function normaliseMessages(messages: OpenAIMessage[]): NormalisedMessage[] {
         } else if (p.type === "input_audio") {
           const audio = (p as { type: "input_audio"; input_audio?: { url?: string; data?: string; format?: string } }).input_audio;
           if (audio) parts.push({ type: "input_audio", input_audio: audio });
+        } else if (p.type === "file") {
+          const f = (p as { type: "file"; file?: { url?: string; data?: string; mime_type?: string; name?: string } }).file;
+          if (f) parts.push({ type: "file", file: f });
         } else if (p.type === "text" && p.text) {
           parts.push({ type: "text", text: p.text });
         }
@@ -832,6 +836,190 @@ async function resolveAudioFiles(
   return results.filter((r): r is QwenFileDescriptor => r !== null);
 }
 
+// ─── Document upload helpers ──────────────────────────────────────────────────
+
+const DOC_EXTENSIONS: Record<string, string> = {
+  pdf: "application/pdf",
+  doc: "application/msword",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  xls: "application/vnd.ms-excel",
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ppt: "application/vnd.ms-powerpoint",
+  pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  txt: "text/plain",
+  md: "text/markdown",
+  csv: "text/csv",
+  json: "application/json",
+  xml: "application/xml",
+  html: "text/html",
+};
+
+/** Detect MIME type for a document from mime_type field, filename, or URL extension. */
+function detectDocMimeType(mimeType?: string, name?: string, url?: string): string {
+  if (mimeType && mimeType !== "application/octet-stream") return mimeType;
+  const src = name || url || "";
+  const ext = src.toLowerCase().split("?")[0].split(".").pop() ?? "";
+  return DOC_EXTENSIONS[ext] ?? "application/octet-stream";
+}
+
+/** Derive a sensible filename for a document. */
+function detectDocFilename(name?: string, url?: string, mimeType?: string): string {
+  if (name) return name;
+  const fromUrl = url?.split("/").pop()?.split("?")[0];
+  if (fromUrl && fromUrl.includes(".")) return fromUrl;
+  const ext = Object.entries(DOC_EXTENSIONS).find(([, m]) => m === mimeType)?.[0] ?? "bin";
+  return `document.${ext}`;
+}
+
+/** Extract file inputs from a message content. */
+function getMessageDocuments(
+  content: string | QwenContentPart[] | null | undefined,
+): { url?: string; data?: string; mime_type?: string; name?: string }[] {
+  if (!content || typeof content === "string") return [];
+  return (content as QwenContentPart[])
+    .filter((p): p is { type: "file"; file: { url?: string; data?: string; mime_type?: string; name?: string } } => p.type === "file")
+    .map(p => p.file);
+}
+
+/**
+ * Upload a single document to Qwen OSS.
+ * Rotates through the token pool automatically if a token hits the rate limit.
+ */
+async function uploadDocumentToQwen(
+  doc: { url?: string; data?: string; mime_type?: string; name?: string },
+  primaryMidtoken: string,
+): Promise<QwenFileDescriptor> {
+  const mimeType = detectDocMimeType(doc.mime_type, doc.name, doc.url);
+  const filename = detectDocFilename(doc.name, doc.url, mimeType);
+
+  // Resolve bytes
+  let buf: Buffer;
+  if (doc.data) {
+    buf = Buffer.from(doc.data, "base64");
+  } else if (doc.url) {
+    try {
+      const res = await fetch(doc.url, {
+        headers: { "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/138.0.0.0 Safari/537.36", "Accept": "*/*" },
+        signal: AbortSignal.timeout(30000),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      buf = Buffer.from(await res.arrayBuffer());
+    } catch {
+      // Fallback: curl
+      const result = execSync(
+        `curl -sL --max-time 30 --max-filesize 52428800 "${doc.url.replace(/"/g, '\\"')}"`,
+        { maxBuffer: 55 * 1024 * 1024, encoding: "buffer" },
+      ) as unknown as Buffer;
+      buf = result;
+    }
+  } else {
+    throw new Error("document: no url or data provided");
+  }
+
+  // Build candidate token list (primary first, then all others for rotation)
+  const allTokens = getAllPoolTokens();
+  const others = allTokens.filter(t => t.token !== primaryMidtoken);
+  const candidates = [
+    { token: primaryMidtoken, ua: allTokens.find(t => t.token === primaryMidtoken)?.ua ?? "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/138.0.0.0 Safari/537.36" },
+    ...others,
+  ];
+
+  let lastErr = "";
+  for (const candidate of candidates) {
+    try {
+      // Get acw_tc cookie
+      const cookieRes = await fetch(QWEN_ORIGIN, {
+        headers: { "User-Agent": candidate.ua, "bx-umidtoken": candidate.token },
+        redirect: "follow",
+      });
+      const setCookie = cookieRes.headers.get("set-cookie") || "";
+      const cookie = setCookie.split(/,(?=[^ ])/).map((c: string) => c.split(";")[0].trim()).join("; ");
+
+      const uploadHeaders: Record<string, string> = {
+        "Content-Type": "application/json",
+        "User-Agent": candidate.ua,
+        "Origin": QWEN_ORIGIN,
+        "Referer": `${QWEN_ORIGIN}/`,
+        "X-Requested-With": "XMLHttpRequest",
+        "X-Source": "web",
+        "bx-v": "2.5.31",
+        "bx-umidtoken": candidate.token,
+        "Cookie": cookie,
+      };
+
+      // Get STS upload token
+      const stsRes = await fetch(`${QWEN_BASE}/files/getstsToken`, {
+        method: "POST",
+        headers: uploadHeaders,
+        body: JSON.stringify({ filename, filesize: String(buf.length), filetype: "doc" }),
+      });
+      const stsJson = (await stsRes.json()) as { success?: boolean; data: Record<string, string> };
+      const sts = stsJson.data;
+
+      if (sts["code"] === "RateLimited") {
+        lastErr = `RateLimited: ${sts["details"]}`;
+        continue;
+      }
+      if (!sts["security_token"]) throw new Error(`doc: unexpected STS response: ${JSON.stringify(sts).slice(0, 200)}`);
+
+      // Upload to OSS
+      const date = new Date().toUTCString();
+      const stringToSign = `PUT\n\n${mimeType}\n${date}\nx-oss-security-token:${sts["security_token"]}\n/${sts["bucketname"]}/${sts["file_path"]}`;
+      const sig = createHmac("sha1", sts["access_key_secret"]).update(stringToSign).digest("base64");
+      const putRes = await fetch(`https://${sts["bucketname"]}.${sts["endpoint"]}/${sts["file_path"]}`, {
+        method: "PUT",
+        headers: {
+          "Content-Type": mimeType,
+          "Date": date,
+          "Authorization": `OSS ${sts["access_key_id"]}:${sig}`,
+          "x-oss-security-token": sts["security_token"],
+        },
+        body: buf,
+      });
+      if (!putRes.ok) throw new Error(`doc: OSS PUT failed: ${putRes.status}`);
+
+      // Parse (let Qwen index the document content)
+      await fetch(`${QWEN_BASE}/files/parse`, {
+        method: "POST",
+        headers: uploadHeaders,
+        body: JSON.stringify({ file_id: sts["file_id"] }),
+      });
+
+      logger.debug({ file_id: sts["file_id"], name: filename }, "doc: uploaded successfully");
+      return {
+        url: sts["file_url"],
+        type: "file",
+        file_type: mimeType,
+        file_class: "file",
+        showType: "file",
+        status: "uploaded",
+        name: filename,
+        id: sts["file_id"],
+      };
+    } catch (err) {
+      lastErr = String(err);
+      logger.debug({ err: lastErr, token: candidate.token.slice(0, 20) }, "doc: upload attempt failed, trying next token");
+    }
+  }
+  throw new Error(`doc: all ${candidates.length} tokens exhausted. Last error: ${lastErr}`);
+}
+
+/** Upload all document inputs in parallel with token rotation. Failures are skipped. */
+async function resolveDocumentFiles(
+  docInputs: { url?: string; data?: string; mime_type?: string; name?: string }[],
+  primaryMidtoken: string,
+): Promise<QwenFileDescriptor[]> {
+  const results = await Promise.all(
+    docInputs.map(d =>
+      uploadDocumentToQwen(d, primaryMidtoken).catch(err => {
+        logger.warn({ err: String(err) }, "doc: upload failed, skipping");
+        return null;
+      }),
+    ),
+  );
+  return results.filter((r): r is QwenFileDescriptor => r !== null);
+}
+
 /** Build plain-text prompt from messages (strips image/audio parts when files[] handles them). */
 function messagesToTextPrompt(messages: NormalisedMessage[], filesHandledByFiles = false): string {
   return messages.map(m => {
@@ -1161,11 +1349,13 @@ router.post("/chat/completions", async (req, res) => {
     }
 
     // 7. Build Qwen payload
-    // Detect image and audio content across all messages
+    // Detect image, audio, and document content across all messages
     const allImageUrls   = augmentedMessages.flatMap(m => getMessageImages(m.content));
     const allAudioInputs = augmentedMessages.flatMap(m => getMessageAudios(m.content));
+    const allDocInputs   = augmentedMessages.flatMap(m => getMessageDocuments(m.content));
     const isVision = allImageUrls.length > 0;
     const isAudio  = allAudioInputs.length > 0;
+    const isDoc    = allDocInputs.length > 0;
 
     // Upload images via OSS (bx-umidtoken + auto-fetched acw_tc cookie)
     let resolvedFiles: QwenFileDescriptor[] = [];
@@ -1185,7 +1375,14 @@ router.post("/chat/completions", async (req, res) => {
       logger.info({ count: audioFiles.length, total: allAudioInputs.length }, "audio: files uploaded");
     }
 
-    // Build text prompt (strip image/audio parts — they're handled natively via files[])
+    // Upload documents via OSS with automatic token rotation on rate limit
+    if (isDoc) {
+      const docFiles = await resolveDocumentFiles(allDocInputs, midtoken);
+      resolvedFiles.push(...docFiles);
+      logger.info({ count: docFiles.length, total: allDocInputs.length }, "doc: files uploaded");
+    }
+
+    // Build text prompt (strip image/audio/doc parts — they're handled natively via files[])
     const qwenMessageContent = messagesToTextPrompt(augmentedMessages, resolvedFiles.length > 0);
 
     const qwenPayload = {
@@ -1212,6 +1409,11 @@ router.post("/chat/completions", async (req, res) => {
         sub_chat_type: "t2t",
       }],
     };
+
+    // Debug: log payload when doc files are present
+    if (isDoc && resolvedFiles.length > 0) {
+      logger.info({ files: resolvedFiles, content: qwenMessageContent }, "doc: sending payload to sidecar");
+    }
 
     // 8. Execute request (n parallel for non-streaming)
     const getBody = () => withSlot(() =>
