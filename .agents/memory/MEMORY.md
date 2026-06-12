@@ -1,4 +1,5 @@
 - [Qwen WAF bypass](qwen-waf-bypass.md) — curl_cffi WITHOUT impersonate= bypasses Aliyun WAF; with impersonate="chrome120" is blocked.
+- [Express 5 wildcard route](express5-wildcard.md) — Express 5 + path-to-regexp v8 requires `*splat` not `*` for catch-all routes; bare `*` throws PathError at startup.
 - [Qwen V2 API model names](qwen-v2-models.md) — Only 3 models in API list; wanx/flux not accessible at completions; see alias map.
 - [Qwen V2 engine interface](qwen-v2-engine.md) — Python sidecar CLI, chat creation, completions URL, OSS upload, SSE parsing.
 - [Qwen audio upload + token rotation](qwen-audio-upload.md) — filetype "audio" OSS flow; rotate getAllPoolTokens() when RateLimited.

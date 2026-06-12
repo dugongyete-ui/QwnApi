@@ -73,7 +73,7 @@ app.use("/v1", v1RateLimit, v1Router);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const dashboardDist = path.resolve(__dirname, "../../gateway-dashboard/dist/public");
 app.use(express.static(dashboardDist));
-app.get("*", (_req, res) => {
+app.get("*splat", (_req, res) => {
   res.sendFile(path.join(dashboardDist, "index.html"));
 });
 
