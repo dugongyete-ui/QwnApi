@@ -76,8 +76,7 @@ interface ColumnAddition {
 }
 
 const ADD_COLUMNS: ColumnAddition[] = [
-  // Example for future schema additions:
-  // { table: "request_logs", column: "input_tokens", definition: "INTEGER NOT NULL DEFAULT 0" },
+  { table: "api_keys", column: "is_master", definition: "BOOLEAN NOT NULL DEFAULT FALSE" },
 ];
 
 // ─── Type-cast fixes ──────────────────────────────────────────────────────────
@@ -151,7 +150,7 @@ export async function runMigrations(): Promise<void> {
   // 4. Seed master API key from GATEWAY_MASTER_KEY env var (idempotent upsert).
   //    This ensures the key survives a fresh DB (new Replit project / deployment)
   //    as long as the env var is set. Safe to run on every startup.
-  const masterKey = process.env["GATEWAY_MASTER_KEY"];
+  const masterKey = process.env["ADMIN_API_KEY"] ?? process.env["GATEWAY_MASTER_KEY"];
   if (masterKey) {
     const keyHash   = createHash("sha256").update(masterKey).digest("hex");
     const preview   = masterKey.length > 8
@@ -167,12 +166,13 @@ export async function runMigrations(): Promise<void> {
     ].join("-");
 
     await pool.query(`
-      INSERT INTO api_keys (id, name, key_hash, key_preview, is_active, request_count, created_at)
-      VALUES ($1, 'master-key (env)', $2, $3, TRUE, 0, NOW())
+      INSERT INTO api_keys (id, name, key_hash, key_preview, is_active, is_master, request_count, created_at)
+      VALUES ($1, 'master-key (env)', $2, $3, TRUE, TRUE, 0, NOW())
       ON CONFLICT (id) DO UPDATE
-        SET key_hash   = EXCLUDED.key_hash,
+        SET key_hash    = EXCLUDED.key_hash,
             key_preview = EXCLUDED.key_preview,
-            is_active  = TRUE
+            is_active   = TRUE,
+            is_master   = TRUE
     `, [deterministicId, keyHash, preview]);
 
     logger.info({ preview }, "DB migration: GATEWAY_MASTER_KEY seeded ✓");

@@ -8,6 +8,7 @@ export const apiKeysTable = pgTable("api_keys", {
   keyHash: text("key_hash").notNull(),
   keyPreview: text("key_preview").notNull(),
   isActive: boolean("is_active").notNull().default(true),
+  isMaster: boolean("is_master").notNull().default(false),
   requestCount: integer("request_count").notNull().default(0),
   lastUsed: timestamp("last_used"),
   createdAt: timestamp("created_at").notNull().defaultNow(),

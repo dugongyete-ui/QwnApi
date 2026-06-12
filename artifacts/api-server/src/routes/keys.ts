@@ -24,7 +24,9 @@ function maskKey(key: string): string {
 
 router.get("/keys", async (req, res) => {
   try {
-    const keys = await db.select().from(apiKeysTable).orderBy(apiKeysTable.createdAt);
+    const keys = await db.select().from(apiKeysTable)
+      .where(eq(apiKeysTable.isMaster, false))
+      .orderBy(apiKeysTable.createdAt);
     res.json({
       keys: keys.map((k) => ({
         id: k.id,
