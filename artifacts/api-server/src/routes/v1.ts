@@ -96,9 +96,11 @@ function qwenPyCreate(token: string, model: string, midtoken?: string): Promise<
  * Send a chat request via Python subprocess and collect the full SSE body.
  */
 function qwenPyBody(token: string, chatId: string, payload: unknown, midtoken?: string): Promise<string> {
-  const payloadB64 = Buffer.from(JSON.stringify(payload)).toString("base64");
-  const args = [QWEN_CFFI_PY, "chat", token, chatId, payloadB64];
+  // Pass "-" as payload arg — Python reads actual JSON from stdin.
+  // This avoids E2BIG (ARG_MAX ~128 KB) when context grows large (many images/iterations).
+  const args = [QWEN_CFFI_PY, "chat", token, chatId, "-"];
   if (midtoken) args.push(midtoken);
+  const payloadJson = JSON.stringify(payload);
 
   return new Promise<string>((resolve, reject) => {
     const py = spawn("python3", args);
@@ -113,6 +115,9 @@ function qwenPyBody(token: string, chatId: string, payload: unknown, midtoken?: 
       else resolve(Buffer.concat(chunks).toString("utf8"));
     });
     py.on("error", reject);
+    // Write payload to stdin and close it so Python's sys.stdin.read() unblocks
+    py.stdin.write(payloadJson, "utf8");
+    py.stdin.end();
   });
 }
 

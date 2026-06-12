@@ -6,3 +6,4 @@
 - [Qwen image generation t2i trick](qwen-image-generation.md) — use qwen3.7-plus + chat_type/sub_chat_type "t2i" inside message object; NOT wanx model names.
 - [Qwen multimodal feature fixes](qwen-multimodal-fixes.md) — vision URL must be downloadable; doc text inline bypass; audio needs omni model.
 - [Qwen document inline](qwen-document-inline.md) — use fields `data`/`mime_type`/`name` (NOT `file_data`/`filename`); text MIMEs inlined as `<document>` block; binary via OSS.
+- [E2BIG spawn fix](e2big-spawn-fix.md) — payload ke Python sidecar wajib via stdin, bukan CLI arg (ARG_MAX ~128KB).

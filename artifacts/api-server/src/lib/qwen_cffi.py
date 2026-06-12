@@ -88,7 +88,11 @@ def cmd_create(token: str, model: str, midtoken: str = "") -> None:
 
 
 def cmd_chat(token: str, chat_id: str, payload_b64: str, midtoken: str = "") -> None:
-    payload = json.loads(base64.b64decode(payload_b64).decode("utf-8"))
+    # "-" means read JSON payload from stdin (avoids ARG_MAX limit for large payloads)
+    if payload_b64 == "-":
+        payload = json.loads(sys.stdin.read())
+    else:
+        payload = json.loads(base64.b64decode(payload_b64).decode("utf-8"))
 
     for attempt in range(MAX_RETRIES):
         chunks: list[bytes] = []
