@@ -1,4 +1,4 @@
-import { execSync, spawn } from "child_process";
+import { spawn } from "child_process";
 import path from "path";
 import { randomUUID } from "crypto";
 import { logger } from "./logger";
@@ -21,26 +21,51 @@ export interface QwenResult {
 
 /** Create a new chat session. Returns the chatId. */
 export async function createChat(midtoken: string, model: string): Promise<QwenResult> {
-  try {
-    const out = execSync(
-      `${PYTHON_BIN} "${QWEN_CFFI_PY}" create "" "${model}" "${midtoken}"`,
-      { timeout: 15000, encoding: "utf8" },
-    );
-    const data = JSON.parse(out) as { success: boolean; data?: { id: string } };
-    if (!data.success || !data.data?.id) {
-      return { success: false, error: `createChat failed: ${out.slice(0, 200)}`, code: "CREATE_FAILED" };
-    }
-    return { success: true, chatId: data.data.id };
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return { success: false, error: msg, code: "CREATE_ERROR" };
-  }
+  const args = [QWEN_CFFI_PY, "create", "", model, midtoken];
+  return new Promise<QwenResult>((resolve) => {
+    const py = spawn(PYTHON_BIN, args);
+    const chunks: Buffer[] = [];
+
+    py.stdout.on("data", (d: Buffer) => chunks.push(d));
+    py.stderr.on("data", (d: Buffer) => logger.warn({ err: d.toString().trim() }, "qwen-cffi create: stderr"));
+
+    const timer = setTimeout(() => {
+      py.kill();
+      resolve({ success: false, error: "qwen-cffi create: timeout", code: "TIMEOUT" });
+    }, 15000);
+
+    py.on("close", (code) => {
+      clearTimeout(timer);
+      if (code !== 0) {
+        resolve({ success: false, error: `qwen-cffi create: exit ${code}`, code: "CREATE_ERROR" });
+        return;
+      }
+      const out = Buffer.concat(chunks).toString("utf8");
+      try {
+        const data = JSON.parse(out) as { success: boolean; data?: { id: string } };
+        if (!data.success || !data.data?.id) {
+          resolve({ success: false, error: `createChat failed: ${out.slice(0, 200)}`, code: "CREATE_FAILED" });
+        } else {
+          resolve({ success: true, chatId: data.data.id });
+        }
+      } catch {
+        resolve({ success: false, error: `createChat JSON parse error: ${out.slice(0, 200)}`, code: "CREATE_ERROR" });
+      }
+    });
+
+    py.on("error", (err) => {
+      clearTimeout(timer);
+      resolve({ success: false, error: `Python spawn error: ${err.message}`, code: "SPAWN_ERROR" });
+    });
+  });
 }
 
-function parseQwenSSE(body: string): { answer: string; thinking: string } {
+function parseQwenSSE(body: string): { answer: string; thinking: string; inputTokens: number; outputTokens: number } {
   let answer = "";
   let thinking = "";
   let fallback = "";
+  let inputTokens = 0;
+  let outputTokens = 0;
   for (const line of body.split("\n")) {
     if (!line.startsWith("data:")) continue;
     const raw = line.slice(5).trim();
@@ -50,7 +75,12 @@ function parseQwenSSE(body: string): { answer: string; thinking: string } {
         choices?: Array<{
           delta?: { content?: string; reasoning_content?: string; extra?: { output_schema?: string } };
         }>;
+        usage?: { input_tokens?: number; output_tokens?: number };
       };
+      if (chunk.usage) {
+        inputTokens = chunk.usage.input_tokens ?? inputTokens;
+        outputTokens = chunk.usage.output_tokens ?? outputTokens;
+      }
       const delta = chunk.choices?.[0]?.delta;
       if (!delta) continue;
       const content = delta.content ?? "";
@@ -67,7 +97,7 @@ function parseQwenSSE(body: string): { answer: string; thinking: string } {
       // skip malformed chunks
     }
   }
-  return { answer: answer || fallback, thinking };
+  return { answer: answer || fallback, thinking, inputTokens, outputTokens };
 }
 
 /** Send a chat message and return the response. */
@@ -132,7 +162,7 @@ export async function chatCompletions(
         return;
       }
       const body = Buffer.concat(chunks).toString("utf8");
-      const { answer, thinking } = parseQwenSSE(body);
+      const { answer, thinking, inputTokens, outputTokens } = parseQwenSSE(body);
 
       if (!answer) {
         // Try to extract structured error
@@ -158,9 +188,9 @@ export async function chatCompletions(
         response: answer,
         thinking: thinking || null,
         finishReason: "stop",
-        promptTokens: 0,
-        completionTokens: Math.ceil(answer.length / 4),
-        totalTokens: Math.ceil(answer.length / 4),
+        promptTokens: inputTokens,
+        completionTokens: outputTokens,
+        totalTokens: inputTokens + outputTokens,
       });
     });
 

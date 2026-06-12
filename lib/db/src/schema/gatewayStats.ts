@@ -1,4 +1,4 @@
-import { pgTable, text, integer, real, timestamp } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, real, timestamp, boolean } from "drizzle-orm/pg-core";
 
 export const gatewayStatsTable = pgTable("gateway_stats", {
   id: text("id").primaryKey().default("singleton"),
@@ -11,7 +11,7 @@ export const gatewayStatsTable = pgTable("gateway_stats", {
 
 export const requestLogsTable = pgTable("request_logs", {
   id: text("id").primaryKey(),
-  success: text("success").notNull(),
+  success: boolean("success").notNull(),
   responseTime: integer("response_time").notNull().default(0),
   model: text("model").notNull(),
   createdAt: timestamp("created_at").notNull().defaultNow(),

@@ -331,7 +331,7 @@ async function incrementKeyUsage(keyId: string) {
 async function recordRequest(success: boolean, responseTime: number, model: string) {
   try {
     await db.insert(requestLogsTable).values({
-      id: randomUUID(), success: success ? "true" : "false", responseTime, model,
+      id: randomUUID(), success, responseTime, model,
     });
     await db.insert(gatewayStatsTable).values({
       id: "singleton", totalRequests: 1,
