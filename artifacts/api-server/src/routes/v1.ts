@@ -1479,4 +1479,129 @@ router.post("/completions", async (req, res) => {
   }
 });
 
+// ── POST /v1/images/generations ───────────────────────────────────────────────
+// OpenAI-compatible image generation via Qwen t2i (Wan model internally).
+// Request:  { prompt, model?, n?, size?, quality? }
+// Response: { created, data: [{ url }] }
+
+router.post("/images/generations", async (req: Request, res: Response) => {
+  const auth = await resolveApiKey(req.headers.authorization);
+  if (!auth.ok) {
+    res.status(auth.statusCode).json({
+      error: { message: auth.error, type: "invalid_request_error", code: "invalid_api_key" },
+    });
+    return;
+  }
+
+  try {
+    const body = req.body as {
+      prompt?: string;
+      model?: string;
+      n?: number;
+      size?: string;
+      quality?: string;
+      response_format?: string;
+    };
+
+    const prompt = body.prompt?.trim();
+    if (!prompt) {
+      res.status(400).json({
+        error: { message: "prompt is required", type: "invalid_request_error", param: "prompt", code: "missing_param" },
+      });
+      return;
+    }
+
+    const n = Math.min(Math.max(body.n ?? 1, 1), 4);
+
+    // qwen3.7-plus is the only model in the API list that supports t2i internally
+    const imageModel = "qwen3.7-plus";
+    const sessionToken = process.env["QWEN_SESSION_TOKEN"] || undefined;
+    const midtoken = await getPooledMidtoken();
+
+    // Generate n images in parallel
+    const tasks = Array.from({ length: n }, async (): Promise<{ url: string } | null> => {
+      try {
+        // Create a standard t2t chat (chat_type t2i goes in the MESSAGE, not the chat)
+        const chatId: string = sessionToken
+          ? await qwenPyCreate(sessionToken, imageModel)
+          : await qwenPyCreate("", imageModel, midtoken);
+
+        const imgPayload = {
+          stream: true,
+          incremental_output: true,
+          chat_id: chatId,
+          chat_mode: "normal",
+          model: imageModel,
+          parent_id: null,
+          messages: [{
+            fid: randomUUID(),
+            parentId: null,
+            childrenIds: [],
+            role: "user",
+            content: prompt,
+            user_action: "chat",
+            files: [],
+            models: [imageModel],
+            chat_type: "t2i",
+            feature_config: { thinking_enabled: false },
+            sub_chat_type: "t2i",
+          }],
+        };
+
+        // Route through Python sidecar (curl_cffi) for WAF bypass
+        const rawBody: string = sessionToken
+          ? await qwenPyBody(sessionToken, chatId, imgPayload)
+          : await qwenPyBody("", chatId, imgPayload, midtoken);
+
+        // Accumulate content from SSE — the final content IS the image URL
+        let imageUrl = "";
+        for (const line of rawBody.split("\n")) {
+          if (!line.startsWith("data:") || line.includes("[DONE]")) continue;
+          try {
+            const chunk = JSON.parse(line.slice(5).trim()) as {
+              choices?: Array<{ delta?: { content?: string } }>;
+            };
+            const content = chunk.choices?.[0]?.delta?.content ?? "";
+            if (content) imageUrl += content;
+          } catch { /* skip malformed chunks */ }
+        }
+
+        imageUrl = imageUrl.trim();
+        if (!imageUrl.startsWith("http")) return null;
+        return { url: imageUrl };
+      } catch (err) {
+        logger.warn({ err: String(err) }, "images/generations: task failed");
+        return null;
+      }
+    });
+
+    const results = await Promise.all(tasks);
+    const images = results.filter((r): r is { url: string } => r !== null);
+
+    if (images.length === 0) {
+      res.status(502).json({
+        error: {
+          message: "Image generation failed — no image returned from upstream",
+          type: "upstream_error",
+          param: null,
+          code: "empty_response",
+        },
+      });
+      return;
+    }
+
+    res.json({
+      created: Math.floor(Date.now() / 1000),
+      data: images,
+    });
+  } catch (err) {
+    logger.error({ err }, "v1/images/generations error");
+    if (!res.headersSent) {
+      res.status(500).json({
+        error: { message: "Internal server error", type: "api_error", param: null, code: "internal_error" },
+      });
+    }
+  }
+});
+
 export default router;
