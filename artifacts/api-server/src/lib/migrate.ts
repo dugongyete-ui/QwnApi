@@ -13,6 +13,7 @@
  *  - Add tricky type changes (e.g. text → boolean) to TYPE_FIXES.
  */
 
+import { createHash } from "crypto";
 import { pool } from "@workspace/db";
 import { logger } from "./logger";
 
@@ -146,4 +147,34 @@ export async function runMigrations(): Promise<void> {
   }
 
   logger.info("DB migration: schema up-to-date ✓");
+
+  // 4. Seed master API key from GATEWAY_MASTER_KEY env var (idempotent upsert).
+  //    This ensures the key survives a fresh DB (new Replit project / deployment)
+  //    as long as the env var is set. Safe to run on every startup.
+  const masterKey = process.env["GATEWAY_MASTER_KEY"];
+  if (masterKey) {
+    const keyHash   = createHash("sha256").update(masterKey).digest("hex");
+    const preview   = masterKey.length > 8
+      ? masterKey.slice(0, 5) + "****" + masterKey.slice(-4)
+      : masterKey;
+    // Deterministic UUID derived from key hash so the row never duplicates
+    const deterministicId = [
+      keyHash.slice(0, 8),
+      keyHash.slice(8, 12),
+      "4" + keyHash.slice(13, 16),
+      ((parseInt(keyHash[16], 16) & 0x3) | 0x8).toString(16) + keyHash.slice(17, 20),
+      keyHash.slice(20, 32),
+    ].join("-");
+
+    await pool.query(`
+      INSERT INTO api_keys (id, name, key_hash, key_preview, is_active, request_count, created_at)
+      VALUES ($1, 'master-key (env)', $2, $3, TRUE, 0, NOW())
+      ON CONFLICT (id) DO UPDATE
+        SET key_hash   = EXCLUDED.key_hash,
+            key_preview = EXCLUDED.key_preview,
+            is_active  = TRUE
+    `, [deterministicId, keyHash, preview]);
+
+    logger.info({ preview }, "DB migration: GATEWAY_MASTER_KEY seeded ✓");
+  }
 }
