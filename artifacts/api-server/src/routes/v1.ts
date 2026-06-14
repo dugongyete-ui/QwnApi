@@ -11,7 +11,7 @@
 import { Router } from "express";
 import { randomUUID } from "crypto";
 import { createHash, createHmac } from "crypto";
-import { spawn, execSync } from "child_process";
+import { spawn } from "child_process";
 import { join } from "path";
 import { withSlot } from "../lib/concurrency";
 import { db } from "@workspace/db";
@@ -495,9 +495,29 @@ function detectMimeType(url: string): string {
   return "image/jpeg";
 }
 
+/**
+ * Async curl runner — replaces execSync to avoid blocking the event loop.
+ * Uses spawn('sh', ['-c', cmd]) so the Node.js event loop stays free during download.
+ */
+function spawnCurlAsync(cmd: string, maxBuffer: number): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    const py = spawn("sh", ["-c", cmd]);
+    py.stdout.on("data", (d: Buffer) => chunks.push(d));
+    py.stderr.on("data", () => { /* discard curl progress/errors */ });
+    const timer = setTimeout(() => { py.kill(); reject(new Error("curl: timeout")); }, (maxBuffer > 30 * 1024 * 1024 ? 35 : 25) * 1000);
+    py.on("close", (code) => {
+      clearTimeout(timer);
+      if (code !== 0) reject(new Error(`curl: exit ${code}`));
+      else resolve(Buffer.concat(chunks));
+    });
+    py.on("error", reject);
+  });
+}
+
 /** Fetch image bytes using curl (bypasses hotlink protection / TLS fingerprint issues). */
-function fetchImageBytesViaCurl(url: string): { buf: Buffer; mimeType: string; filename: string } {
-  const result = execSync(
+async function fetchImageBytesViaCurl(url: string): Promise<{ buf: Buffer; mimeType: string; filename: string }> {
+  const result = await spawnCurlAsync(
     `curl -sL --max-time 20 --max-filesize 20971520 \
       -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36" \
       -H "Accept: image/avif,image/webp,image/apng,image/*,*/*;q=0.8" \
@@ -506,8 +526,8 @@ function fetchImageBytesViaCurl(url: string): { buf: Buffer; mimeType: string; f
       --tlsv1.2 \
       -w "\\n__CONTENT_TYPE__:%{content_type}__STATUS__:%{http_code}" \
       "${url.replace(/"/g, '\\"')}"`,
-    { maxBuffer: 25 * 1024 * 1024, encoding: "buffer" },
-  ) as unknown as Buffer;
+    25 * 1024 * 1024,
+  );
 
   const raw = result.toString("latin1");
   const metaMatch = raw.match(/\n__CONTENT_TYPE__:([^_]*)__STATUS__:(\d+)$/);
@@ -696,15 +716,15 @@ async function fetchAudioBytes(url: string, mimeType: string): Promise<{ buf: Bu
     }
   } catch { /* fall through to curl */ }
 
-  // Fallback: curl
-  const result = execSync(
+  // Fallback: curl (async — does not block event loop)
+  const result = await spawnCurlAsync(
     `curl -sL --max-time 30 --max-filesize 52428800 \
       -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/138.0.0.0 Safari/537.36" \
       -H "Accept: */*" \
       -w "\\n__CONTENT_TYPE__:%{content_type}__STATUS__:%{http_code}" \
       "${url.replace(/"/g, '\\"')}"`,
-    { maxBuffer: 55 * 1024 * 1024, encoding: "buffer" },
-  ) as unknown as Buffer;
+    55 * 1024 * 1024,
+  );
   const raw = result.toString("latin1");
   const metaMatch = raw.match(/\n__CONTENT_TYPE__:([^_]*)__STATUS__:(\d+)$/);
   if (!metaMatch) throw new Error("curl: failed to parse audio metadata");
@@ -918,12 +938,11 @@ async function uploadDocumentToQwen(
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       buf = Buffer.from(await res.arrayBuffer());
     } catch {
-      // Fallback: curl
-      const result = execSync(
+      // Fallback: curl (async — does not block event loop)
+      buf = await spawnCurlAsync(
         `curl -sL --max-time 30 --max-filesize 52428800 "${doc.url.replace(/"/g, '\\"')}"`,
-        { maxBuffer: 55 * 1024 * 1024, encoding: "buffer" },
-      ) as unknown as Buffer;
-      buf = result;
+        55 * 1024 * 1024,
+      );
     }
   } else {
     throw new Error("document: no url or data provided");
@@ -1103,6 +1122,7 @@ function detectToolCalls(
   const trimmed = raw.trim().replace(/```(?:json)?/gi, "").trim();
 
   // Walk string finding JSON objects with "tool_calls"
+  // String-aware: tracks inStr + escape so braces inside quoted values don't confuse depth.
   const allCalls: ToolCall[] = [];
   let searchFrom = 0;
   while (searchFrom < trimmed.length) {
@@ -1110,9 +1130,16 @@ function detectToolCalls(
     if (blockStart === -1) break;
     let depth = 0;
     let blockEnd = -1;
+    let inStr = false;
+    let escape = false;
     for (let i = blockStart; i < trimmed.length; i++) {
-      if (trimmed[i] === "{") depth++;
-      else if (trimmed[i] === "}") {
+      const c = trimmed[i];
+      if (escape) { escape = false; continue; }
+      if (c === "\\") { escape = true; continue; }
+      if (c === '"') { inStr = !inStr; continue; }
+      if (inStr) continue;
+      if (c === "{") depth++;
+      else if (c === "}") {
         depth--;
         if (depth === 0) { blockEnd = i; break; }
       }
