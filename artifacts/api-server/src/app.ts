@@ -73,6 +73,13 @@ app.use("/v1", v1RateLimit, v1Router);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const dashboardDist = path.resolve(__dirname, "../../gateway-dashboard/dist/public");
 app.use(express.static(dashboardDist));
+
+// Return proper JSON 404 for unknown /v1 or /api paths — must be BEFORE the SPA catch-all
+// so API clients get machine-readable errors instead of the dashboard HTML.
+app.use(["/v1", "/api"], (_req, res) => {
+  res.status(404).json({ error: { message: "Not found", type: "invalid_request_error", param: null, code: "not_found" } });
+});
+
 app.get("*splat", (_req, res) => {
   res.sendFile(path.join(dashboardDist, "index.html"));
 });

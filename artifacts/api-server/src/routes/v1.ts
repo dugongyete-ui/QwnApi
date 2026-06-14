@@ -95,7 +95,7 @@ function qwenPyCreate(token: string, model: string, midtoken?: string): Promise<
 /**
  * Send a chat request via Python subprocess and collect the full SSE body.
  */
-function qwenPyBody(token: string, chatId: string, payload: unknown, midtoken?: string): Promise<string> {
+function qwenPyBody(token: string, chatId: string, payload: unknown, midtoken?: string, signal?: AbortSignal): Promise<string> {
   // Pass "-" as payload arg — Python reads actual JSON from stdin.
   // This avoids E2BIG (ARG_MAX ~128 KB) when context grows large (many images/iterations).
   const args = [QWEN_CFFI_PY, "chat", token, chatId, "-"];
@@ -104,17 +104,24 @@ function qwenPyBody(token: string, chatId: string, payload: unknown, midtoken?: 
 
   return new Promise<string>((resolve, reject) => {
     const py = spawn("python3", args);
+
+    // Kill subprocess immediately if caller already disconnected
+    if (signal?.aborted) { py.kill(); reject(new Error("qwen-cffi: aborted")); return; }
+    const onAbort = () => { py.kill(); reject(new Error("qwen-cffi: aborted")); };
+    signal?.addEventListener("abort", onAbort, { once: true });
+
     const chunks: Buffer[] = [];
     py.stdout.on("data", (d: Buffer) => chunks.push(d));
     py.stderr.on("data", (d: Buffer) => logger.warn({ err: d.toString().trim() }, "qwen-cffi: stderr"));
     const timer = setTimeout(() => { py.kill(); reject(new Error("qwen-cffi: timeout")); }, 90000);
     py.on("close", (code) => {
       clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
       // exit 2 = risk-control triggered; Python already wrote error SSE to stdout — resolve it.
       if (code !== 0 && code !== 2) reject(new Error(`qwen-cffi: exit ${code}`));
       else resolve(Buffer.concat(chunks).toString("utf8"));
     });
-    py.on("error", reject);
+    py.on("error", (err) => { signal?.removeEventListener("abort", onAbort); reject(err); });
     // Write payload to stdin and close it so Python's sys.stdin.read() unblocks
     py.stdin.write(payloadJson, "utf8");
     py.stdin.end();
@@ -176,8 +183,6 @@ function parseQwenSSE(body: string): {
 // ─── Model registry ───────────────────────────────────────────────────────────
 
 const QWEN_API_MODEL_MAP: Record<string, string> = {
-  "qwen3-235b-a22b":  "qwen-plus-2025-07-28",
-  "qwen3-30b-a3b":    "qwen3.5-35b-a3b",
   "qwen-plus":        "qwen-plus-2025-07-28",
   "qwen-max":         "qwen3.7-max",
   "qwen-turbo":       "qwen3.5-flash",
@@ -1482,10 +1487,10 @@ router.post("/chat/completions", async (req, res) => {
     }
 
     // 8. Execute request (n parallel for non-streaming)
-    const getBody = () => withSlot(() =>
+    const getBody = (signal?: AbortSignal) => withSlot(() =>
       sessionToken
-        ? qwenPyBody(sessionToken, chatId!, qwenPayload)
-        : qwenPyBody("", chatId!, qwenPayload, midtoken),
+        ? qwenPyBody(sessionToken, chatId!, qwenPayload, undefined, signal)
+        : qwenPyBody("", chatId!, qwenPayload, midtoken, signal),
       auth.isAdmin
     );
 
@@ -1494,7 +1499,16 @@ router.post("/chat/completions", async (req, res) => {
       setupSSE(res);
       res.write(sseChunk(completionId, _rawModel, created, { role: "assistant", content: "" }, null));
 
-      const body_str = await getBody();
+      // Kill the Python subprocess if the client disconnects mid-stream
+      const controller = new AbortController();
+      const onClose = () => controller.abort();
+      req.once("close", onClose);
+      let body_str: string;
+      try {
+        body_str = await getBody(controller.signal);
+      } finally {
+        req.off("close", onClose);
+      }
       checkQwenWaf(body_str);
       const { content: rawContent, inputTokens, outputTokens, upstreamError } = parseQwenSSE(body_str);
 
