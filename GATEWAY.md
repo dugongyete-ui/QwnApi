@@ -561,10 +561,10 @@ Gateway membutuhkan `bx-umidtoken` (token anti-bot Alibaba) untuk setiap request
 
 | Property | Nilai |
 |----------|-------|
-| Pool size | 509 slot |
+| Pool size | **2000 slot** |
 | Cache disk | `artifacts/api-server/token_cache.json` |
 | Keepalive | Refresh otomatis setiap 50 menit |
-| Rotation | Saat upload gagal karena rate limit, rotasi ke token pool lain |
+| Rotation | Round-robin antar token; rotasi per-token saat upload rate limit |
 
 ```bash
 # Cek status pool
@@ -586,22 +586,153 @@ curl -X POST http://localhost:8080/api/token-pool/refresh
 
 ---
 
+## Robustness & Retry
+
+Gateway secara otomatis menangani error transient dari Qwen — agent tidak perlu implementasi retry sendiri.
+
+**Retry logic (3x dengan exponential backoff):**
+- Error `timeout`, `exit 1`, crash Python sidecar → retry otomatis 1.5s / 3s / fail
+- Error `WAF blocked` atau client `aborted` → langsung fail (tidak di-retry)
+- Retry terjadi **transparan** — client tidak tahu sedang di-retry
+
+**Python-level retry (per-request):**
+- Risk-control Qwen (WAF session-level) → retry 3x dengan jeda 3s / 6s di dalam Python sidecar
+- Session create gagal → retry 3x dengan jeda 1.5s / 3s sebelum return error
+
+**Single-spawn optimization:**
+- Setiap request hanya spawn **1 Python subprocess** (create + chat digabung dalam satu proses)
+- Sebelumnya: 2 spawn terpisah (create → chat) yang menambah ~500–1500ms overhead per call
+
+---
+
+## Format Error
+
+Semua error dari gateway menggunakan format OpenAI-compatible yang konsisten:
+
+```json
+{
+  "error": {
+    "message": "Deskripsi error yang jelas",
+    "type": "invalid_request_error | server_error | gateway_error | upstream_error | service_unavailable",
+    "code": "snake_case_error_code"
+  }
+}
+```
+
+**Tipe error yang umum:**
+
+| `type` | `code` | HTTP | Keterangan |
+|--------|--------|------|-----------|
+| `invalid_request_error` | `invalid_api_key` | 401 | Key tidak valid atau tidak ada |
+| `invalid_request_error` | `invalid_value` | 400 | Body request tidak valid |
+| `gateway_error` | `token_pool_empty` | 503 | Pool `bx-umidtoken` habis |
+| `upstream_error` | `qwen_risk_control` | 503 | Qwen server busy/rate limit |
+| `gateway_error` | `create_failed` | 503 | Gagal buat sesi Qwen setelah retry |
+| `service_unavailable` | `qwen_waf_blocked` | 503 | IP diblokir WAF Aliyun |
+| `service_unavailable` | `OVERLOADED` | 503 | Concurrency queue penuh (>80 request) |
+| `server_error` | `internal_error` | 500 | Error internal gateway |
+
+---
+
+## Tool Calling (Function Calling) untuk AI Agent
+
+Gateway mendukung penuh OpenAI function calling — cocok untuk autonomous agent yang memanggil tools secara loop.
+
+**Contoh request dengan tools:**
+
+```python
+from openai import OpenAI
+
+client = OpenAI(api_key="sk-dzeck-...", base_url="http://localhost:8080/v1")
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_price",
+            "description": "Get current asset price",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string"},
+                    "timeframe": {"type": "string"}
+                },
+                "required": ["symbol"]
+            }
+        }
+    }
+]
+
+# Step 1: agent memanggil tool
+response = client.chat.completions.create(
+    model="qwen3.7-max",
+    tools=tools,
+    tool_choice="auto",
+    messages=[{"role": "user", "content": "Berapa harga XAUUSD sekarang?"}]
+)
+
+choice = response.choices[0]
+# finish_reason = "tool_calls" → agent mau panggil tool
+if choice.finish_reason == "tool_calls":
+    tool_call = choice.message.tool_calls[0]
+    fn_name = tool_call.function.name       # "get_price"
+    fn_args = tool_call.function.arguments  # '{"symbol":"XAUUSD"}'
+
+    # Step 2: eksekusi tool dan feed hasilnya kembali
+    messages = [
+        {"role": "user", "content": "Berapa harga XAUUSD sekarang?"},
+        choice.message,  # assistant message dengan tool_calls
+        {
+            "role": "tool",
+            "tool_call_id": tool_call.id,
+            "content": '{"price": 3342.50, "change": "+0.73%"}'
+        }
+    ]
+
+    # Step 3: agent melanjutkan dengan hasil tool
+    final = client.chat.completions.create(
+        model="qwen3.7-max",
+        tools=tools,
+        messages=messages
+    )
+    print(final.choices[0].message.content)
+```
+
+**Fitur tool calling yang didukung:**
+- `tool_choice: "auto"` — model memutuskan sendiri kapan pakai tool
+- `tool_choice: "required"` — selalu panggil tool
+- `tool_choice: {"type":"function","function":{"name":"..."}}` — paksa tool tertentu
+- `parallel_tool_calls` — model bisa panggil beberapa tools sekaligus dalam satu response
+- Multi-turn loop: feed tool result → panggil LLM lagi → tools lagi → dst.
+
+**Performance test (10-step agent loop, XAUUSD analysis):**
+- 5 steps hingga keputusan final (agent selesai lebih awal — normal)
+- 10 tool calls total (beberapa paralel di step yang sama)
+- 11,778 token total context
+- 31.9 detik wall time, rata-rata **6.4 detik per LLM call**
+- Tidak ada error atau retry yang terlihat dari luar
+
+---
+
 ## Hasil Test Semua Fitur (Verified)
 
 | Fitur | Status | Catatan |
 |-------|--------|---------|
 | `GET /v1/models` | ✅ | 13 model listed |
-| Chat teks | ✅ | 12×12=144, token count akurat |
-| Streaming SSE | ✅ | Word-by-word real-time |
-| Vision | ✅ | Fjord Norwegia — deskripsi akurat |
-| Dokumen `.md` | ✅ | Apel Rp5.000, Jeruk Rp3.000 — terbaca dari base64 inline |
-| Audio WAV | ✅ | 440Hz → "nada sambung telepon" (model: qwen-audio-turbo) |
+| Chat teks | ✅ | Token count akurat |
+| Streaming SSE | ✅ | Word-by-word real-time, include_usage support |
+| Vision | ✅ | URL gambar & data URI |
+| Dokumen `.md` | ✅ | Inline base64 decode |
+| Audio WAV | ✅ | Model: `qwen-audio-turbo` |
 | Image generation | ✅ | URL `cdn.qwenlm.ai/output/...` |
+| Tool calling | ✅ | Parallel tools, multi-turn loop |
+| Agent loop (10-step) | ✅ | 5 steps, 10 tool calls, 31.9s, error 0 |
+| Retry otomatis | ✅ | Transparan ke client |
 | `GET /api/keys` | ✅ | `{keys:[...], total:N}` |
 | `POST /api/keys` | ✅ | `{id, name, key, keyPreview, createdAt, isActive}` |
 | `DELETE /api/keys` | ✅ | `{success:true}` |
 | `GET /api/stats` | ✅ | 100% success rate |
-| `GET /api/token-pool` | ✅ | 505 token aktif |
+| `GET /api/token-pool` | ✅ | 1988+ token aktif |
 | `POST /api/token-pool/refresh` | ✅ | Force refresh |
 
 ---
