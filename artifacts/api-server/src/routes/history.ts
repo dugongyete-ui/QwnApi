@@ -25,34 +25,34 @@ router.get("/history", async (req, res) => {
     });
   } catch (err) {
     req.log.error({ err }, "History list error");
-    res.status(500).json({ error: "Failed to fetch history" });
+    res.status(500).json({ error: { message: "Failed to fetch history", type: "server_error", code: "internal_error" } });
   }
 });
 
 router.get("/history/:conversationId", async (req, res) => {
   const parsed = GetConversationParams.safeParse(req.params);
   if (!parsed.success) {
-    res.status(400).json({ error: "Invalid conversation ID" });
+    res.status(400).json({ error: { message: "Invalid conversation ID", type: "invalid_request_error", code: "invalid_value" } });
     return;
   }
 
   try {
     const rows = await db.select().from(chatSessionsTable).where(eq(chatSessionsTable.conversationId, parsed.data.conversationId));
     if (!rows[0]) {
-      res.status(404).json({ error: "Conversation not found" });
+      res.status(404).json({ error: { message: "Conversation not found", type: "invalid_request_error", code: "not_found" } });
       return;
     }
     res.json(rows[0]);
   } catch (err) {
     req.log.error({ err }, "Get conversation error");
-    res.status(500).json({ error: "Failed to fetch conversation" });
+    res.status(500).json({ error: { message: "Failed to fetch conversation", type: "server_error", code: "internal_error" } });
   }
 });
 
 router.delete("/history/:conversationId", async (req, res) => {
   const parsed = DeleteConversationParams.safeParse(req.params);
   if (!parsed.success) {
-    res.status(400).json({ error: "Invalid conversation ID" });
+    res.status(400).json({ error: { message: "Invalid conversation ID", type: "invalid_request_error", code: "invalid_value" } });
     return;
   }
 
@@ -61,7 +61,7 @@ router.delete("/history/:conversationId", async (req, res) => {
     res.json({ success: true, message: "Conversation deleted" });
   } catch (err) {
     req.log.error({ err }, "Delete conversation error");
-    res.status(500).json({ error: "Failed to delete conversation" });
+    res.status(500).json({ error: { message: "Failed to delete conversation", type: "server_error", code: "internal_error" } });
   }
 });
 

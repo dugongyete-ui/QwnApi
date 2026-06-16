@@ -21,7 +21,7 @@ const MODELS = [
 router.post("/chat", async (req, res) => {
   const parsed = SendChatBody.safeParse(req.body);
   if (!parsed.success) {
-    res.status(400).json({ error: "Invalid request body" });
+    res.status(400).json({ error: { message: "Invalid request body", type: "invalid_request_error", code: "invalid_value" } });
     return;
   }
 
@@ -30,7 +30,7 @@ router.post("/chat", async (req, res) => {
 
   const midtoken = await getPooledMidtoken();
   if (!midtoken) {
-    res.status(503).json({ error: "No available tokens in pool", code: "TOKEN_POOL_EMPTY" });
+    res.status(503).json({ error: { message: "No available tokens in pool", type: "server_error", code: "TOKEN_POOL_EMPTY" } });
     return;
   }
 
@@ -56,7 +56,7 @@ router.post("/chat", async (req, res) => {
 
     if (!result.success) {
       await recordRequest(false, Date.now() - startTime, model);
-      res.status(500).json({ error: result.error ?? "Gateway error", code: result.code });
+      res.status(500).json({ error: { message: result.error ?? "Gateway error", type: "server_error", code: result.code ?? "internal_error" } });
       return;
     }
 
@@ -113,7 +113,7 @@ router.post("/chat", async (req, res) => {
   } catch (err) {
     req.log.error({ err }, "Chat error");
     await recordRequest(false, Date.now() - startTime, model);
-    res.status(500).json({ error: "Internal gateway error" });
+    res.status(500).json({ error: { message: "Internal gateway error", type: "server_error", code: "internal_error" } });
   }
 });
 

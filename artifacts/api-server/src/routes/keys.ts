@@ -41,14 +41,14 @@ router.get("/keys", async (req, res) => {
     });
   } catch (err) {
     req.log.error({ err }, "List keys error");
-    res.status(500).json({ error: "Failed to list API keys" });
+    res.status(500).json({ error: { message: "Failed to list API keys", type: "server_error", code: "internal_error" } });
   }
 });
 
 router.post("/keys", async (req, res) => {
   const parsed = CreateApiKeyBody.safeParse(req.body);
   if (!parsed.success) {
-    res.status(400).json({ error: "Invalid request body" });
+    res.status(400).json({ error: { message: "Invalid request body", type: "invalid_request_error", code: "invalid_value" } });
     return;
   }
 
@@ -75,14 +75,14 @@ router.post("/keys", async (req, res) => {
     });
   } catch (err) {
     req.log.error({ err }, "Create key error");
-    res.status(500).json({ error: "Failed to create API key" });
+    res.status(500).json({ error: { message: "Failed to create API key", type: "server_error", code: "internal_error" } });
   }
 });
 
 router.delete("/keys/:id", async (req, res) => {
   const parsed = DeleteApiKeyParams.safeParse(req.params);
   if (!parsed.success) {
-    res.status(400).json({ error: "Invalid key ID" });
+    res.status(400).json({ error: { message: "Invalid key ID", type: "invalid_request_error", code: "invalid_value" } });
     return;
   }
 
@@ -91,7 +91,7 @@ router.delete("/keys/:id", async (req, res) => {
     res.json({ success: true, message: "API key deleted" });
   } catch (err) {
     req.log.error({ err }, "Delete key error");
-    res.status(500).json({ error: "Failed to delete API key" });
+    res.status(500).json({ error: { message: "Failed to delete API key", type: "server_error", code: "internal_error" } });
   }
 });
 
@@ -100,7 +100,7 @@ router.patch("/keys/:id", async (req, res) => {
   const bodyParsed = UpdateApiKeyBody.safeParse(req.body);
 
   if (!paramsParsed.success || !bodyParsed.success) {
-    res.status(400).json({ error: "Invalid request" });
+    res.status(400).json({ error: { message: "Invalid request", type: "invalid_request_error", code: "invalid_value" } });
     return;
   }
 
@@ -114,7 +114,7 @@ router.patch("/keys/:id", async (req, res) => {
     const rows = await db.select().from(apiKeysTable).where(eq(apiKeysTable.id, paramsParsed.data.id));
     const k = rows[0];
     if (!k) {
-      res.status(404).json({ error: "Key not found" });
+      res.status(404).json({ error: { message: "Key not found", type: "invalid_request_error", code: "not_found" } });
       return;
     }
 
@@ -129,7 +129,7 @@ router.patch("/keys/:id", async (req, res) => {
     });
   } catch (err) {
     req.log.error({ err }, "Update key error");
-    res.status(500).json({ error: "Failed to update API key" });
+    res.status(500).json({ error: { message: "Failed to update API key", type: "server_error", code: "internal_error" } });
   }
 });
 

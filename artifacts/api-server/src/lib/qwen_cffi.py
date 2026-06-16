@@ -87,15 +87,9 @@ def cmd_create(token: str, model: str, midtoken: str = "") -> None:
     sys.stdout.flush()
 
 
-def cmd_chat(token: str, chat_id: str, payload_b64: str, midtoken: str = "") -> None:
-    # "-" means read JSON payload from stdin (avoids ARG_MAX limit for large payloads)
-    if payload_b64 == "-":
-        payload = json.loads(sys.stdin.read())
-    else:
-        payload = json.loads(base64.b64decode(payload_b64).decode("utf-8"))
-
+def _stream_chat(token: str, chat_id: str, payload: dict, midtoken: str = "") -> None:
+    """Core SSE streaming with risk-control retry. Shared by cmd_chat and cmd_create_and_chat."""
     for attempt in range(MAX_RETRIES):
-        chunks: list[bytes] = []
         first_chunk_checked = False
         risk_hit = False
 
@@ -118,10 +112,10 @@ def cmd_chat(token: str, chat_id: str, payload_b64: str, midtoken: str = "") -> 
             sys.stdout.buffer.flush()
 
         if not risk_hit:
-            return  # success
+            return
 
         if attempt < MAX_RETRIES - 1:
-            time.sleep(RETRY_DELAY * (attempt + 1))  # back-off: 3s, 6s
+            time.sleep(RETRY_DELAY * (attempt + 1))
         else:
             err_msg = json.dumps({
                 "error": {
@@ -133,6 +127,77 @@ def cmd_chat(token: str, chat_id: str, payload_b64: str, midtoken: str = "") -> 
             sys.stdout.write(f"data: {err_msg}\n\ndata: [DONE]\n\n")
             sys.stdout.flush()
             sys.exit(2)
+
+
+def cmd_chat(token: str, chat_id: str, payload_b64: str, midtoken: str = "") -> None:
+    # "-" means read JSON payload from stdin (avoids ARG_MAX limit for large payloads)
+    if payload_b64 == "-":
+        payload = json.loads(sys.stdin.read())
+    else:
+        payload = json.loads(base64.b64decode(payload_b64).decode("utf-8"))
+    _stream_chat(token, chat_id, payload, midtoken)
+
+
+def cmd_create_and_chat(token: str, model: str, midtoken: str, payload_b64: str) -> None:
+    """
+    Combined create + chat in a single Python process.
+    1. Creates a new Qwen chat session (with retry on transient failures).
+    2. Emits "X-Chat-Id: <chat_id>\\n" so the TypeScript caller can extract the session ID.
+    3. Injects chat_id into the payload and streams the SSE response.
+
+    payload_b64: "-" to read JSON from stdin, or base64-encoded JSON string.
+    """
+    # Read payload first — must consume stdin before any stdout to avoid pipe deadlock
+    if payload_b64 == "-":
+        payload = json.loads(sys.stdin.read())
+    else:
+        payload = json.loads(base64.b64decode(payload_b64).decode("utf-8"))
+
+    # Step 1: Create chat session with retry
+    chat_id: str | None = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            r = req.post(
+                f"{BASE}/chats/new",
+                json={
+                    "title":     "New Chat",
+                    "models":    [model],
+                    "chat_mode": "normal",
+                    "chat_type": "t2t",
+                    "timestamp": int(time.time() * 1000),
+                },
+                headers=_headers(token, midtoken),
+                timeout=15,
+            )
+            data = r.json()
+            if data.get("success") and data.get("data", {}).get("id"):
+                chat_id = data["data"]["id"]
+                break
+        except Exception:
+            pass
+        if attempt < MAX_RETRIES - 1:
+            time.sleep(1.5 * (attempt + 1))
+
+    if not chat_id:
+        err_msg = json.dumps({
+            "error": {
+                "message": "Failed to create Qwen chat session after retries.",
+                "type": "gateway_error",
+                "code": "create_failed",
+            }
+        })
+        sys.stdout.write("X-Chat-Id: \n")
+        sys.stdout.write(f"data: {err_msg}\n\ndata: [DONE]\n\n")
+        sys.stdout.flush()
+        return
+
+    # Step 2: Announce chat_id to the TypeScript caller before streaming
+    sys.stdout.write(f"X-Chat-Id: {chat_id}\n")
+    sys.stdout.flush()
+
+    # Step 3: Inject chat_id into payload and stream SSE
+    payload["chat_id"] = chat_id
+    _stream_chat(token, chat_id, payload, midtoken)
 
 
 def cmd_upload(token: str, image_source_b64: str) -> None:
@@ -262,6 +327,11 @@ def main() -> None:
         payload  = sys.argv[4]
         midtoken = sys.argv[5] if len(sys.argv) > 5 else ""
         cmd_chat(token, chat_id, payload, midtoken)
+    elif cmd == "create_and_chat":
+        model    = sys.argv[3]
+        midtoken = sys.argv[4] if len(sys.argv) > 4 else ""
+        payload  = sys.argv[5] if len(sys.argv) > 5 else "-"
+        cmd_create_and_chat(token, model, midtoken, payload)
     elif cmd == "upload":
         image_source_b64 = sys.argv[3]
         cmd_upload(token, image_source_b64)

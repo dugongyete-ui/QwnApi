@@ -64,65 +64,90 @@ function checkQwenWaf(text: string): void {
 }
 
 /**
- * Create a new Qwen chat session via Python subprocess (async — does NOT block the event loop).
- * Returns the chat ID.
+ * Retry wrapper for transient Qwen sidecar errors.
+ * Does NOT retry user aborts or WAF blocks (those are permanent).
  */
-function qwenPyCreate(token: string, model: string, midtoken?: string): Promise<string> {
-  const mid = midtoken ?? "";
-  const args = [QWEN_CFFI_PY, "create", token, model, mid];
-  return new Promise<string>((resolve, reject) => {
-    const py = spawn("python3", args);
-    const chunks: Buffer[] = [];
-    py.stdout.on("data", (d: Buffer) => chunks.push(d));
-    py.stderr.on("data", (d: Buffer) => logger.warn({ err: d.toString().trim() }, "qwen-cffi create: stderr"));
-    const timer = setTimeout(() => { py.kill(); reject(new Error("qwen-cffi create: timeout")); }, 15000);
-    py.on("close", (code) => {
-      clearTimeout(timer);
-      if (code !== 0) { reject(new Error(`qwen-cffi create: exit ${code}`)); return; }
-      const out = Buffer.concat(chunks).toString("utf8");
-      try {
-        checkQwenWaf(out);
-        const data = JSON.parse(out) as { success?: boolean; data?: { id?: string } };
-        const chatId = data?.data?.id;
-        if (!chatId) reject(new Error(`qwen: createChat failed: ${out.slice(0, 200)}`));
-        else resolve(chatId);
-      } catch (e) { reject(e); }
-    });
-    py.on("error", reject);
-  });
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  maxAttempts = 3,
+  baseDelayMs = 1500,
+): Promise<T> {
+  let lastErr: unknown;
+  for (let i = 0; i < maxAttempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      const permanent = msg.includes("aborted") || msg.includes("WAF") || msg.includes("QWEN_SESSION_TOKEN");
+      if (permanent || i === maxAttempts - 1) throw err;
+      const delay = baseDelayMs * (i + 1);
+      logger.warn({ attempt: i + 1, maxAttempts, err: msg }, `qwen-cffi: transient error, retrying in ${delay}ms`);
+      await new Promise<void>(r => setTimeout(r, delay));
+    }
+  }
+  throw lastErr;
 }
 
 /**
- * Send a chat request via Python subprocess and collect the full SSE body.
+ * Combined create + chat in a single Python subprocess.
+ * Eliminates the double-spawn overhead (~300–800 ms per request).
+ * Python creates the Qwen session, injects chat_id into the payload, then streams SSE.
+ * Returns { chatId, body } — chatId for session persistence, body is the full SSE string.
  */
-function qwenPyBody(token: string, chatId: string, payload: unknown, midtoken?: string, signal?: AbortSignal): Promise<string> {
-  // Pass "-" as payload arg — Python reads actual JSON from stdin.
-  // This avoids E2BIG (ARG_MAX ~128 KB) when context grows large (many images/iterations).
-  const args = [QWEN_CFFI_PY, "chat", token, chatId, "-"];
-  if (midtoken) args.push(midtoken);
+function qwenPyCreateAndChat(
+  token: string,
+  model: string,
+  midtoken: string,
+  payload: unknown,
+  signal?: AbortSignal,
+): Promise<{ chatId: string; body: string }> {
+  const args = [QWEN_CFFI_PY, "create_and_chat", token, model, midtoken, "-"];
   const payloadJson = JSON.stringify(payload);
 
-  return new Promise<string>((resolve, reject) => {
+  return new Promise((resolve, reject) => {
     const py = spawn("python3", args);
 
-    // Kill subprocess immediately if caller already disconnected
     if (signal?.aborted) { py.kill(); reject(new Error("qwen-cffi: aborted")); return; }
     const onAbort = () => { py.kill(); reject(new Error("qwen-cffi: aborted")); };
     signal?.addEventListener("abort", onAbort, { once: true });
 
-    const chunks: Buffer[] = [];
-    py.stdout.on("data", (d: Buffer) => chunks.push(d));
-    py.stderr.on("data", (d: Buffer) => logger.warn({ err: d.toString().trim() }, "qwen-cffi: stderr"));
-    const timer = setTimeout(() => { py.kill(); reject(new Error("qwen-cffi: timeout")); }, 90000);
+    const sseChunks: Buffer[] = [];
+    let chatId = "";
+    let headerBuf = "";
+    let headerDone = false;
+
+    py.stdout.on("data", (d: Buffer) => {
+      if (!headerDone) {
+        headerBuf += d.toString("utf8");
+        const nl = headerBuf.indexOf("\n");
+        if (nl !== -1) {
+          const firstLine = headerBuf.slice(0, nl);
+          if (firstLine.startsWith("X-Chat-Id: ")) chatId = firstLine.slice("X-Chat-Id: ".length).trim();
+          headerDone = true;
+          const rest = headerBuf.slice(nl + 1);
+          if (rest) sseChunks.push(Buffer.from(rest, "utf8"));
+          headerBuf = "";
+        }
+      } else {
+        sseChunks.push(d);
+      }
+    });
+
+    py.stderr.on("data", (d: Buffer) => logger.warn({ err: d.toString().trim() }, "qwen-cffi create_and_chat: stderr"));
+
+    // 15 s (create) + 90 s (chat) + 5 s buffer
+    const timer = setTimeout(() => { py.kill(); reject(new Error("qwen-cffi: timeout")); }, 110000);
+
     py.on("close", (code) => {
       clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);
-      // exit 2 = risk-control triggered; Python already wrote error SSE to stdout — resolve it.
-      if (code !== 0 && code !== 2) reject(new Error(`qwen-cffi: exit ${code}`));
-      else resolve(Buffer.concat(chunks).toString("utf8"));
+      if (code !== 0 && code !== 2) { reject(new Error(`qwen-cffi: exit ${code}`)); return; }
+      resolve({ chatId, body: Buffer.concat(sseChunks).toString("utf8") });
     });
-    py.on("error", (err) => { signal?.removeEventListener("abort", onAbort); reject(err); });
-    // Write payload to stdin and close it so Python's sys.stdin.read() unblocks
+
+    py.on("error", (err) => { clearTimeout(timer); signal?.removeEventListener("abort", onAbort); reject(err); });
+
     py.stdin.write(payloadJson, "utf8");
     py.stdin.end();
   });
@@ -1408,17 +1433,8 @@ router.post("/chat/completions", async (req, res) => {
       return;
     }
 
-    // 6. Always create a fresh Qwen chat per request.
-    // Guest mode (no QWEN_SESSION_TOKEN) does not persist server-side history, so
-    // we manage the full conversation in our DB and replay it as the prompt each turn.
-    chatId = await withSlot(() =>
-      sessionToken
-        ? qwenPyCreate(sessionToken, model)
-        : qwenPyCreate("", model, midtoken),
-      auth.isAdmin
-    );
-
     // 7. Build Qwen payload
+    // (chat_id is NOT set here — Python injects it after creating the session)
     // Detect image, audio, and document content in the current request messages only
     // (history files were already processed in previous turns)
     const allImageUrls   = normalisedRequest.flatMap(m => getMessageImages(m.content));
@@ -1459,7 +1475,6 @@ router.post("/chat/completions", async (req, res) => {
     const qwenPayload = {
       stream: true,
       incremental_output: true,
-      chat_id: chatId,
       chat_mode: "normal",
       model,
       temperature,
@@ -1486,12 +1501,14 @@ router.post("/chat/completions", async (req, res) => {
       logger.info({ files: resolvedFiles, content: qwenMessageContent }, "doc: sending payload to sidecar");
     }
 
-    // 8. Execute request (n parallel for non-streaming)
-    const getBody = (signal?: AbortSignal) => withSlot(() =>
-      sessionToken
-        ? qwenPyBody(sessionToken, chatId!, qwenPayload, undefined, signal)
-        : qwenPyBody("", chatId!, qwenPayload, midtoken, signal),
-      auth.isAdmin
+    // 8. Execute request via combined create+chat (single Python spawn, eliminates double-spawn overhead)
+    const getResult = (signal?: AbortSignal) => withSlot(
+      () => withRetry(() =>
+        sessionToken
+          ? qwenPyCreateAndChat(sessionToken, model, "", qwenPayload, signal)
+          : qwenPyCreateAndChat("", model, midtoken, qwenPayload, signal)
+      ),
+      auth.isAdmin,
     );
 
     // ── STREAMING path ──────────────────────────────────────────────────────
@@ -1505,7 +1522,9 @@ router.post("/chat/completions", async (req, res) => {
       req.once("close", onClose);
       let body_str: string;
       try {
-        body_str = await getBody(controller.signal);
+        const result = await getResult(controller.signal);
+        if (result.chatId) chatId = result.chatId;
+        body_str = result.body;
       } finally {
         req.off("close", onClose);
       }
@@ -1565,10 +1584,11 @@ router.post("/chat/completions", async (req, res) => {
     }
 
     // ── NON-STREAMING path ───────────────────────────────────────────────────
-    const bodies = await Promise.all(Array.from({ length: n }, () => getBody()));
-    const parsed = bodies.map(b => {
-      checkQwenWaf(b);
-      return parseQwenSSE(b);
+    const results = await Promise.all(Array.from({ length: n }, () => getResult()));
+    if (results[0]?.chatId) chatId = results[0].chatId;
+    const parsed = results.map(r => {
+      checkQwenWaf(r.body);
+      return parseQwenSSE(r.body);
     });
 
     const firstParsed = parsed[0];
@@ -1703,15 +1723,8 @@ router.post("/completions", async (req, res) => {
     const sessionToken = getQwenSessionToken();
     const midtoken = sessionToken ? "" : await getPooledMidtoken();
 
-    const chatId = await withSlot(() =>
-      sessionToken
-        ? qwenPyCreate(sessionToken, model)
-        : qwenPyCreate("", model, midtoken),
-      auth.isAdmin
-    );
-
     const qwenPayload = {
-      stream: true, incremental_output: true, chat_id: chatId, chat_mode: "normal",
+      stream: true, incremental_output: true, chat_mode: "normal",
       model, temperature, parent_id: null,
       messages: [{
         fid: randomUUID(), parentId: null, childrenIds: [], role: "user",
@@ -1720,11 +1733,13 @@ router.post("/completions", async (req, res) => {
       }],
     };
 
-    const rawBody = await withSlot(() =>
-      sessionToken
-        ? qwenPyBody(sessionToken, chatId, qwenPayload)
-        : qwenPyBody("", chatId, qwenPayload, midtoken),
-      auth.isAdmin
+    const { body: rawBody } = await withSlot(
+      () => withRetry(() =>
+        sessionToken
+          ? qwenPyCreateAndChat(sessionToken, model, "", qwenPayload)
+          : qwenPyCreateAndChat("", model, midtoken, qwenPayload)
+      ),
+      auth.isAdmin,
     );
 
     checkQwenWaf(rawBody);
@@ -1803,15 +1818,9 @@ router.post("/images/generations", async (req: Request, res: Response) => {
     // Generate n images in parallel
     const tasks = Array.from({ length: n }, async (): Promise<{ url: string } | null> => {
       try {
-        // Create a standard t2t chat (chat_type t2i goes in the MESSAGE, not the chat)
-        const chatId: string = sessionToken
-          ? await qwenPyCreate(sessionToken, imageModel)
-          : await qwenPyCreate("", imageModel, midtoken);
-
         const imgPayload = {
           stream: true,
           incremental_output: true,
-          chat_id: chatId,
           chat_mode: "normal",
           model: imageModel,
           parent_id: null,
@@ -1830,10 +1839,12 @@ router.post("/images/generations", async (req: Request, res: Response) => {
           }],
         };
 
-        // Route through Python sidecar (curl_cffi) for WAF bypass
-        const rawBody: string = sessionToken
-          ? await qwenPyBody(sessionToken, chatId, imgPayload)
-          : await qwenPyBody("", chatId, imgPayload, midtoken);
+        // Route through Python sidecar (curl_cffi) for WAF bypass — combined create+chat
+        const { body: rawBody } = await withRetry(() =>
+          sessionToken
+            ? qwenPyCreateAndChat(sessionToken, imageModel, "", imgPayload)
+            : qwenPyCreateAndChat("", imageModel, midtoken, imgPayload)
+        );
 
         // Accumulate content from SSE — the final content IS the image URL
         let imageUrl = "";
