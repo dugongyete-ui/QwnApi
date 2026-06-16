@@ -1470,7 +1470,22 @@ router.post("/chat/completions", async (req, res) => {
     }
 
     // Build text prompt (strip image/audio/doc parts — they're handled natively via files[])
-    const qwenMessageContent = messagesToTextPrompt(augmentedMessages, resolvedFiles.length > 0);
+    const _basePrompt = messagesToTextPrompt(augmentedMessages, resolvedFiles.length > 0);
+
+    // Re-inject a short tool reminder at the END of the prompt when tools are active.
+    // The full tool definitions are already injected at the start via injectToolPrompt(),
+    // but in long agentic sessions that system block gets diluted by hundreds of turns.
+    // Appending a compact reminder here keeps it close to where the model generates its
+    // next token — dramatically reducing "lazy" plain-text responses mid-task.
+    const qwenMessageContent = hasTools
+      ? _basePrompt +
+        "\n\n---\n" +
+        "TOOL REMINDER: You are in the middle of an ongoing task. " +
+        "If you still need data or have not completed all required steps, " +
+        "call a tool now using the JSON format: " +
+        '{"tool_calls":[{"name":"TOOL_NAME","arguments":{...}}]}. ' +
+        "Do NOT write a final analysis or conclusion until you have gathered all necessary data."
+      : _basePrompt;
 
     const qwenPayload = {
       stream: true,
