@@ -1475,16 +1475,54 @@ router.post("/chat/completions", async (req, res) => {
     // bahwa dia harus memanggil tools.
     // Threshold: 24 non-system messages (~4-6 step analisis penuh).
     const SLIDING_WINDOW_SIZE = 24;
+    // Truncate individual messages yang terlalu panjang (tool results market data
+    // bisa berisi JSON besar 3000–6000 char). Bahkan 24 messages bisa overflow
+    // context window jika masing-masing 4000+ char. Potong di 3000 char agar
+    // data kunci tetap ada tapi context total tidak meledak.
+    // System messages TIDAK ditruncate — tool definitions harus utuh.
+    const MAX_MSG_CHARS = 3000;
+    function truncateMsgContent(m: NormalisedMessage): NormalisedMessage {
+      if (typeof m.content === "string" && m.content.length > MAX_MSG_CHARS) {
+        const overflow = m.content.length - MAX_MSG_CHARS;
+        return { ...m, content: m.content.slice(0, MAX_MSG_CHARS) + `\n[...+${overflow} chars truncated for context efficiency]` };
+      }
+      if (Array.isArray(m.content)) {
+        let changed = false;
+        const newParts = (m.content as Array<{ type: string; text?: string }>).map(p => {
+          if (p.type === "text" && p.text && p.text.length > MAX_MSG_CHARS) {
+            const overflow = p.text.length - MAX_MSG_CHARS;
+            changed = true;
+            return { ...p, text: p.text.slice(0, MAX_MSG_CHARS) + `\n[...+${overflow} chars truncated]` };
+          }
+          return p;
+        });
+        return changed ? { ...m, content: newParts as NormalisedMessage["content"] } : m;
+      }
+      return m;
+    }
     const windowedMessages = (() => {
       const systemMsgs  = augmentedMessages.filter(m => m.role === "system");
       const nonSysMsgs  = augmentedMessages.filter(m => m.role !== "system");
-      if (nonSysMsgs.length <= SLIDING_WINDOW_SIZE) return augmentedMessages;
-      const trimmed = nonSysMsgs.slice(nonSysMsgs.length - SLIDING_WINDOW_SIZE);
-      logger.info(
-        { total: augmentedMessages.length, kept: systemMsgs.length + trimmed.length, window: SLIDING_WINDOW_SIZE },
-        "context-window: trimmed old messages to prevent tool-call dilution"
-      );
-      return [...systemMsgs, ...trimmed];
+      const sliced = nonSysMsgs.length > SLIDING_WINDOW_SIZE
+        ? nonSysMsgs.slice(nonSysMsgs.length - SLIDING_WINDOW_SIZE)
+        : nonSysMsgs;
+      if (nonSysMsgs.length > SLIDING_WINDOW_SIZE) {
+        logger.info(
+          { total: augmentedMessages.length, kept: systemMsgs.length + sliced.length, window: SLIDING_WINDOW_SIZE },
+          "context-window: trimmed old messages to prevent tool-call dilution"
+        );
+      }
+      // Truncate oversized non-system messages AFTER slicing.
+      // Log hanya kalau ada yang benar-benar dipotong.
+      const capped = sliced.map(truncateMsgContent);
+      const truncatedCount = capped.filter((m, i) => m !== sliced[i]).length;
+      if (truncatedCount > 0) {
+        logger.info(
+          { truncatedCount, maxChars: MAX_MSG_CHARS },
+          "context-window: truncated oversized message content"
+        );
+      }
+      return [...systemMsgs, ...capped];
     })();
 
     // Build text prompt (strip image/audio/doc parts — they're handled natively via files[])
