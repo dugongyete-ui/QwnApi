@@ -54,6 +54,8 @@ lib/
 - **Retry di Python sidecar**: Session create retry 3x (jeda 1.5s/3s). Risk-control Qwen retry 3x (jeda 3s/6s). Total fallback chain sebelum error dikembalikan ke TypeScript.
 - **Format error konsisten**: Semua endpoint (`/v1/*`, `/api/*`) mengembalikan `{ error: { message, type, code } }` — OpenAI-compatible. Tidak ada silent fallback.
 - **Inline text dokumen**: File teks (md, txt, csv, json) di-decode dari base64 dan di-inline langsung ke prompt sebagai `<document>` block, bukan mengandalkan Qwen OSS parse (yang async dan tidak di-poll). Binary files (PDF, DOCX) tetap via OSS.
+- **Sliding window (agentic sessions)**: Sebelum prompt dikirim ke Qwen, gateway filter `augmentedMessages` → pertahankan semua system messages + ambil hanya 24 non-system messages terakhir. Ini mencegah model "tenggelam" dalam history panjang dan lupa memanggil tools. Threshold dikontrol oleh `SLIDING_WINDOW_SIZE` di `v1.ts`. Log: `context-window: trimmed old messages`.
+- **Tool reminder re-injection**: Saat `hasTools=true`, gateway menambahkan TOOL REMINDER di akhir prompt (setelah `messagesToTextPrompt()`). Ini memastikan model "ingat" format tool call meski tool definitions di system block sudah jauh tertinggal di atas context.
 - **Vision via OSS upload**: Gambar diunduh gateway lalu di-upload ke Qwen OSS via STS token sebelum dikirim ke model. URL gambar harus bisa diakses oleh server (hindari URL Wikipedia/hotlink-protected).
 - **Audio butuh model omni**: Model text-only (qwen3-30b-a3b, dll.) tidak bisa proses audio meski file terupload. Gunakan `qwen-audio-turbo` atau `qwen2.5-omni-7b` untuk request audio.
 
@@ -84,6 +86,8 @@ Lihat **GATEWAY.md** untuk dokumentasi API lengkap beserta contoh kode.
 - **`success` column di DB**: Tipe `boolean` bukan `text`. Migration cast otomatis, tapi kalau ada error `invalid input syntax for type boolean` jalankan: `ALTER TABLE gateway_stats ALTER COLUMN success TYPE boolean USING (success::boolean)`.
 - **Rebuild wajib setelah edit `v1.ts`**: Workflow API Server otomatis rebuild (`pnpm run build && pnpm run start`), tapi kalau manual: `pnpm --filter @workspace/api-server run build`.
 - **Jangan tambah 2-spawn ke sidecar**: Command baru wajib pakai `create_and_chat` (1 spawn). Jangan kembalikan ke pola `qwenPyCreate` + `qwenPyBody` terpisah — menambah latency 500–1500ms dan melipatgandakan slot concurrency yang terpakai.
+- **Sliding window tidak memotong system messages**: `SLIDING_WINDOW_SIZE` hanya berlaku untuk non-system messages. System messages (tool definitions, system prompt) selalu dipertahankan penuh.
+- **Tool reminder hanya aktif saat `hasTools=true`**: Untuk request chat biasa tanpa tools, `qwenMessageContent = _basePrompt` tanpa tambahan apapun.
 - **Retry tidak berlaku untuk WAF/aborted**: `withRetry()` skip retry kalau message error mengandung kata `"WAF"`, `"aborted"`, atau `"QWEN_SESSION_TOKEN"` — ini error permanen, bukan transient.
 - **Python stdout protocol**: Baris pertama dari Python sidecar adalah `X-Chat-Id: <uuid>\n` — TypeScript buffer sampai `\n` pertama untuk ekstrak chat ID, sisanya adalah SSE stream. Jangan ubah urutan ini di `qwen_cffi.py`.
 

@@ -634,6 +634,51 @@ Semua error dari gateway menggunakan format OpenAI-compatible yang konsisten:
 
 ---
 
+## Optimasi untuk Agentic / Long-Running Sessions
+
+Untuk AI agent otonom yang menjalankan banyak step (5–10+ langkah dengan banyak tool call per step), gateway memiliki dua mekanisme otomatis untuk mencegah model "malas" dan berhenti memanggil tools:
+
+### 1. Sliding Window Context (24 non-system messages)
+
+Sebelum prompt dikirim ke Qwen, gateway hanya mengambil **system messages + 24 non-system messages terakhir**. Pesan dari step-step awal yang sudah tidak relevan dibuang secara otomatis.
+
+**Mengapa perlu:** Setiap step agent menghasilkan banyak message turns (execution prompt + narasi sebelum tool + hasil tool + narasi sesudah tool). Untuk analisis 6 step × 5 tool call per step = 60+ message pairs. Tanpa sliding window, semua itu dikirim ke Qwen di step terakhir — model "tenggelam" dalam history panjang dan lupa bahwa ada tools yang bisa dipanggil.
+
+**Cara kerja:**
+```
+augmentedMessages (semua)
+    │
+    ├── systemMsgs  → selalu dipertahankan (tool definitions, system prompt)
+    └── nonSysMsgs  → ambil 24 terakhir saja
+            │
+            ▼
+    windowedMessages → dikirim ke Qwen
+```
+
+Log saat sliding window aktif:
+```
+context-window: trimmed old messages  total=67  kept=26  window=24
+```
+
+Untuk mengubah threshold, edit `SLIDING_WINDOW_SIZE` di `artifacts/api-server/src/routes/v1.ts`.
+
+### 2. Tool Reminder Re-injection
+
+Di akhir setiap prompt (saat `hasTools=true`), gateway menambahkan pengingat singkat tentang format tool call — tepat sebelum model mulai generate. Ini memastikan model "ingat" ada tools meski system block tool definitions ada di awal prompt yang jauh.
+
+```
+[...ribuan token context...]
+---
+TOOL REMINDER: You are in the middle of an ongoing task.
+If you still need data or have not completed all required steps,
+call a tool now using the JSON format: {"tool_calls":[...]}
+Do NOT write a final analysis or conclusion until you have gathered all necessary data.
+```
+
+**Kedua mekanisme ini bekerja bersamaan dan transparan** — client/agent tidak perlu mengubah apapun dari sisinya.
+
+---
+
 ## Tool Calling (Function Calling) untuk AI Agent
 
 Gateway mendukung penuh OpenAI function calling — cocok untuk autonomous agent yang memanggil tools secara loop.
@@ -748,3 +793,5 @@ if choice.finish_reason == "tool_calls":
 | 503 WAF blocked | curl_cffi pakai `impersonate=` | Hapus semua flag `impersonate` dari `qwen_cffi.py` |
 | Pool 0 token | Server baru restart | Tunggu ~10 detik atau hit `POST /api/token-pool/refresh` |
 | DB error: invalid input for boolean | Kolom `success` tipe lama (`text`) | Jalankan: `ALTER TABLE gateway_stats ALTER COLUMN success TYPE boolean USING (success::boolean)` |
+| Agent berhenti panggil tools di step tengah | Context terlalu panjang (>24 non-system messages) | Sudah ditangani otomatis oleh sliding window. Cek log `context-window: trimmed`. Turunkan `SLIDING_WINDOW_SIZE` jika masih terjadi. |
+| Agent nulis teks biasa alih-alih JSON tool call | Tool definitions terkubur dalam context panjang | Sudah ditangani otomatis oleh tool reminder re-injection di akhir prompt. |

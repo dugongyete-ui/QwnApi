@@ -7,4 +7,4 @@
 - [Qwen multimodal feature fixes](qwen-multimodal-fixes.md) — vision URL must be downloadable; doc text inline bypass; audio needs omni model.
 - [Qwen document inline](qwen-document-inline.md) — use fields `data`/`mime_type`/`name` (NOT `file_data`/`filename`); text MIMEs inlined as `<document>` block; binary via OSS.
 - [E2BIG spawn fix](e2big-spawn-fix.md) — payload ke Python sidecar wajib via stdin, bukan CLI arg (ARG_MAX ~128KB).
-- [Agentic tool reminder re-injection](agentic-tool-reminder.md) — append tool reminder di akhir prompt saat hasTools=true; mencegah model "malas" saat konteks panjang.
+- [Agentic tool calling fixes](agentic-tool-reminder.md) — dua lapis: (1) sliding window 24 non-system messages sebelum kirim ke Qwen, (2) tool reminder di akhir prompt saat hasTools=true.
