@@ -1469,8 +1469,26 @@ router.post("/chat/completions", async (req, res) => {
       logger.info({ count: docFiles.length, total: allDocInputs.length }, "doc: files uploaded");
     }
 
+    // Sliding window: ketika konteks terlalu panjang, hanya kirim
+    // system messages + N non-system messages terakhir ke Qwen.
+    // Ini mencegah model "tenggelam" dalam history panjang dan lupa
+    // bahwa dia harus memanggil tools.
+    // Threshold: 24 non-system messages (~4-6 step analisis penuh).
+    const SLIDING_WINDOW_SIZE = 24;
+    const windowedMessages = (() => {
+      const systemMsgs  = augmentedMessages.filter(m => m.role === "system");
+      const nonSysMsgs  = augmentedMessages.filter(m => m.role !== "system");
+      if (nonSysMsgs.length <= SLIDING_WINDOW_SIZE) return augmentedMessages;
+      const trimmed = nonSysMsgs.slice(nonSysMsgs.length - SLIDING_WINDOW_SIZE);
+      logger.info(
+        { total: augmentedMessages.length, kept: systemMsgs.length + trimmed.length, window: SLIDING_WINDOW_SIZE },
+        "context-window: trimmed old messages to prevent tool-call dilution"
+      );
+      return [...systemMsgs, ...trimmed];
+    })();
+
     // Build text prompt (strip image/audio/doc parts — they're handled natively via files[])
-    const _basePrompt = messagesToTextPrompt(augmentedMessages, resolvedFiles.length > 0);
+    const _basePrompt = messagesToTextPrompt(windowedMessages, resolvedFiles.length > 0);
 
     // Re-inject a short tool reminder at the END of the prompt when tools are active.
     // The full tool definitions are already injected at the start via injectToolPrompt(),
