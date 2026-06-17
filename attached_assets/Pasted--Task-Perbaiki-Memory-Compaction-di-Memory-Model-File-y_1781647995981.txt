@@ -1,0 +1,59 @@
+## Task: Perbaiki Memory Compaction di Memory Model
+
+### File yang perlu diedit
+`backend/app/domain/models/memory.py`
+
+### Mengapa fix ini diperlukan
+Method `compact()` saat ini hanya melakukan dua hal:
+1. Menghapus data base64 image dari HumanMessages
+2. Memotong isi tool result yang terlalu panjang menjadi 3000 karakter
+
+Yang TIDAK dilakukan: menghapus message pairs lama dari step-step yang sudah selesai. Akibatnya setiap kali step baru dimulai, semua pesan lama ikut terkirim ke model:
+- AIMessage berisi `tool_calls` (dispatch object dari setiap tool yang dipanggil)
+- ToolMessage berisi hasil dari setiap tool
+- Pesan narasi `message_notify_user` yang dipanggil sebelum dan sesudah setiap tool
+
+Untuk analisis 5 step dengan 5 tool call per step, ini menghasilkan 50+ message pairs lama yang ikut dikirim ke LLM di setiap step berikutnya. Model menjadi "terkubur" oleh context lama, kehilangan fokus pada tool definitions, dan akhirnya melewati tool calls — langsung memalsukan hasil ("ghost success") alih-alih benar-benar memanggil tools.
+
+### Apa yang dilakukan fix ini
+Menambahkan **Pass 3** pada method `compact()` yang sudah ada. Pass 3 menghapus tool call/result pairs dari step yang sudah selesai. Hasil dari setiap step sudah tersimpan di `step.result`, jadi message-message itu tidak dibutuhkan lagi di context.
+
+**Penting**: Fix ini TIDAK mengubah perilaku agent, logika berpikir, maupun kedalaman analisisnya. Hanya membersihkan pesan-pesan yang sudah tidak relevan agar model menerima context yang lebih bersih di step berikutnya.
+
+### Implementasi fix — tambahkan Pass 3 di dalam method `compact()`
+
+Di `memory.py`, setelah blok Pass 2 yang sudah ada (bagian `_MAX_TOOL_RESULT_CHARS`), tambahkan Pass 3 berikut:
+
+```python
+        # --- Pass 3: hapus intermediate tool call/result pairs ---
+        # Setelah sebuah step selesai, semua AIMessage berisi tool_calls dan
+        # ToolMessage response-nya sudah dirangkum di step.result.
+        # Menyimpannya di memory hanya mengembungkan context untuk step
+        # berikutnya, membuat model lupa tool yang tersedia dan melewati
+        # tool calls ("ghost success").
+        # Yang dipertahankan: SystemMessage, HumanMessage, dan AIMessage
+        # yang benar-benar berisi teks (narasi / JSON result akhir step).
+        # Yang dihapus: AIMessage murni berisi tool_calls (tanpa teks) dan
+        # semua ToolMessage.
+        cleaned = []
+        for msg in self.messages:
+            # Selalu pertahankan system dan human messages
+            if msg.type in ("system", "human"):
+                cleaned.append(msg)
+                continue
+            # Hapus semua tool response messages
+            if msg.type == "tool":
+                continue
+            # Untuk AI messages: pertahankan hanya yang memiliki teks nyata.
+            # Pure tool-call dispatch messages memiliki content kosong atau spasi saja.
+            if msg.type == "ai":
+                content_text = (
+                    msg.content if isinstance(msg.content, str) else ""
+                )
+                if content_text.strip():
+                    cleaned.append(msg)
+                # else: pure tool-dispatch message — buang
+                continue
+            # Pertahankan tipe lain sebagai fallback
+            cleaned.append(msg)
+        self.messages = cleaned
