@@ -4,7 +4,7 @@ modules = ["nodejs-24", "python-3.11", "postgresql-16"]
 router = "application"
 deploymentTarget = "autoscale"
 run = ["sh", "-c", "PORT=8080 node artifacts/api-server/dist/index.mjs"]
-build = ["bash", "-c", "pnpm --filter @workspace/api-server run build && pnpm --filter @workspace/gateway-dashboard run build"]
+build = ["sh", "-c", "pnpm --filter @workspace/api-server run build && pnpm --filter @workspace/gateway-dashboard run build"]
 
 [deployment.postBuild]
 args = ["pnpm", "store", "prune"]

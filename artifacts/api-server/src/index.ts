@@ -35,16 +35,25 @@ try {
   process.exit(1);
 }
 
-// Wait for token pool first batch to be ready before accepting traffic.
-// If token_cache.json exists this resolves instantly (sync disk read).
-// If no cache, waits ~2–3s for first 10 network tokens.
-await waitForFirstBatch();
-
+// Start listening IMMEDIATELY so Autoscale health check (GET /) can pass.
+// The dashboard static files are served at / without needing the token pool,
+// so the health check returns 200 right away regardless of pool status.
+// Token pool initialization continues in the background — chat requests that
+// arrive before the pool is ready will receive a 503 "token pool empty" response
+// (same as when the pool is exhausted at runtime), which is correct behavior.
 app.listen(port, (err) => {
   if (err) {
     logger.error({ err }, "Error listening on port");
     process.exit(1);
   }
-
   logger.info({ port }, "Server listening");
+});
+
+// Initialize token pool in background — does NOT block server startup.
+// waitForFirstBatch() triggers initPool() if not already running, then
+// resolves once the first 10 tokens are fetched (or instantly if cache exists).
+waitForFirstBatch().then(() => {
+  logger.info("Token pool ready — gateway accepting chat requests");
+}).catch((err) => {
+  logger.warn({ err }, "Token pool initialization warning (pool will retry automatically)");
 });

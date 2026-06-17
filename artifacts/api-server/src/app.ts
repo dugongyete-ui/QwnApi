@@ -81,7 +81,12 @@ app.use(["/v1", "/api"], (_req, res) => {
 });
 
 app.get("*splat", (_req, res) => {
-  res.sendFile(path.join(dashboardDist, "index.html"));
+  res.sendFile(path.join(dashboardDist, "index.html"), (err) => {
+    if (err) {
+      // Dashboard not built yet (dev mode) or file missing — return 200 for health checks
+      res.status(200).send("Qwen Gateway API Server is running.");
+    }
+  });
 });
 
 // Warm the bx-umidtoken pool at startup (non-blocking)

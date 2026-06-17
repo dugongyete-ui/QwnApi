@@ -2165,12 +2165,19 @@ function loadDiskCache(): number {
 
 async function fetchToken(userAgent: string): Promise<string> {
   try {
-    const res = await fetch(UMID_URL, {
-      headers: { "User-Agent": userAgent },
-    });
-    const text = await res.text();
-    const m = text.match(/(?:umx\.wu|__fycb)\('([^']+)'\)/);
-    return m ? m[1] : "";
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10_000);
+    try {
+      const res = await fetch(UMID_URL, {
+        headers: { "User-Agent": userAgent },
+        signal: controller.signal,
+      });
+      const text = await res.text();
+      const m = text.match(/(?:umx\.wu|__fycb)\('([^']+)'\)/);
+      return m ? m[1] : "";
+    } finally {
+      clearTimeout(timer);
+    }
   } catch {
     return "";
   }
