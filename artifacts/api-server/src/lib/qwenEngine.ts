@@ -1,10 +1,25 @@
 import { spawn } from "child_process";
+import { existsSync } from "fs";
 import path from "path";
 import { randomUUID } from "crypto";
 import { logger } from "./logger";
 
 const QWEN_CFFI_PY = path.resolve(import.meta.dirname, "qwen_cffi.py");
-const PYTHON_BIN = "python3";
+
+// Prefer the Replit-local Python that has curl_cffi installed.
+// In dev, Replit auto-injects .pythonlibs/bin into PATH, but production
+// autoscale containers do not inherit that PATH augmentation.
+// Resolving the absolute path here guarantees the correct interpreter
+// is used regardless of environment.
+const _localPy = path.resolve(process.cwd(), ".pythonlibs/bin/python3");
+const PYTHON_BIN = existsSync(_localPy) ? _localPy : "python3";
+
+// Extra env for every spawn: ensure .pythonlibs packages are importable.
+const _pythonlibsSite = path.resolve(process.cwd(), ".pythonlibs/lib/python3.12/site-packages");
+const PYTHON_ENV: NodeJS.ProcessEnv = {
+  ...process.env,
+  PYTHONPATH: [_pythonlibsSite, process.env["PYTHONPATH"] ?? ""].filter(Boolean).join(":"),
+};
 
 export interface QwenResult {
   success: boolean;
@@ -23,7 +38,7 @@ export interface QwenResult {
 export async function createChat(midtoken: string, model: string): Promise<QwenResult> {
   const args = [QWEN_CFFI_PY, "create", "", model, midtoken];
   return new Promise<QwenResult>((resolve) => {
-    const py = spawn(PYTHON_BIN, args);
+    const py = spawn(PYTHON_BIN, args, { env: PYTHON_ENV });
     const chunks: Buffer[] = [];
 
     py.stdout.on("data", (d: Buffer) => chunks.push(d));
@@ -144,7 +159,7 @@ export async function chatCompletions(
   const payloadB64 = Buffer.from(JSON.stringify(payload)).toString("base64");
 
   return new Promise<QwenResult>((resolve) => {
-    const py = spawn(PYTHON_BIN, [QWEN_CFFI_PY, "chat", "", chatId, payloadB64, midtoken]);
+    const py = spawn(PYTHON_BIN, [QWEN_CFFI_PY, "chat", "", chatId, payloadB64, midtoken], { env: PYTHON_ENV });
     const chunks: Buffer[] = [];
 
     py.stdout.on("data", (d: Buffer) => chunks.push(d));

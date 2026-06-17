@@ -12,7 +12,8 @@ import { Router } from "express";
 import { randomUUID } from "crypto";
 import { createHash, createHmac } from "crypto";
 import { spawn } from "child_process";
-import { join } from "path";
+import { existsSync } from "fs";
+import { join, resolve } from "path";
 import { withSlot } from "../lib/concurrency";
 import { db } from "@workspace/db";
 import { chatSessionsTable, apiKeysTable, gatewayStatsTable, requestLogsTable } from "@workspace/db";
@@ -22,9 +23,19 @@ import { logger } from "../lib/logger";
 
 const router = Router();
 
-// ─── Python sidecar path ──────────────────────────────────────────────────────
+// ─── Python sidecar path & binary ─────────────────────────────────────────────
 
 const QWEN_CFFI_PY = join(__dirname, "qwen_cffi.py");
+
+// Use .pythonlibs Python (has curl_cffi) — production autoscale doesn't inherit
+// Replit's PATH augmentation, so we resolve the path explicitly here.
+const _localPy = resolve(process.cwd(), ".pythonlibs/bin/python3");
+const PYTHON_BIN = existsSync(_localPy) ? _localPy : "python3";
+const _pythonlibsSite = resolve(process.cwd(), ".pythonlibs/lib/python3.12/site-packages");
+const PYTHON_ENV: NodeJS.ProcessEnv = {
+  ...process.env,
+  PYTHONPATH: [_pythonlibsSite, process.env["PYTHONPATH"] ?? ""].filter(Boolean).join(":"),
+};
 
 const QWEN_ORIGIN = "https://chat.qwen.ai";
 const QWEN_BASE   = `${QWEN_ORIGIN}/api/v2`;
@@ -106,7 +117,7 @@ function qwenPyCreateAndChat(
   const payloadJson = JSON.stringify(payload);
 
   return new Promise((resolve, reject) => {
-    const py = spawn("python3", args);
+    const py = spawn(PYTHON_BIN, args, { env: PYTHON_ENV });
 
     if (signal?.aborted) { py.kill(); reject(new Error("qwen-cffi: aborted")); return; }
     const onAbort = () => { py.kill(); reject(new Error("qwen-cffi: aborted")); };
